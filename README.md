@@ -83,21 +83,12 @@ Everything is fetched, tagged, and filed into the right folder automatically.
 
 ## Keep Antra alive
 
-Antra takes real time to maintain and improve. If it's useful to you, consider giving back:
+Antra takes real time to maintain and improve. If it's useful to you, consider becoming a patron:
 
 <p align="center">
-  <a href="https://ko-fi.com/antraverse">
-    <img src="https://img.shields.io/badge/Support_on_Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white"/>
+  <a href="https://www.patreon.com/AntraVerse">
+    <img src="https://img.shields.io/badge/Support_on_Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white" alt="Support Antra on Patreon"/>
   </a>
-  &nbsp;
-  <a href="https://github.com/anandprtp/Antra">
-    <img src="https://img.shields.io/badge/⭐_Star_the_Repo-FFD700?style=for-the-badge&logo=github&logoColor=black"/>
-  </a>
-</p>
-
-<p align="center">
-  PayPal: <a href="https://paypal.me/hoshiyaar1501">https://paypal.me/hoshiyaar1501</a><br/>
-  USDT (TRC20): <code>TCzJhbLfeSphfwRAmXTQrPKW3RrniG2H8q</code>
 </p>
 
 ---
