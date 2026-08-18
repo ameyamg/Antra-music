@@ -52,6 +52,20 @@ jobs:
           New-Item -ItemType Directory -Force -Path runtime/backend | Out-Null
           pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
 
+      - name: Smoke test backend
+        working-directory: antra-wails
+        shell: pwsh
+        run: |
+          # v1.1.8 shipped three broken releases because the build was judged by
+          # "it compiled" instead of "it runs". This runs the real download entry
+          # point; ModuleNotFoundError here fails the BUILD, never the user.
+          $out = & ./runtime/backend/AntraBackend.exe "https://open.spotify.com/track/0000000000000000000000" --config nul 2>&1 | Out-String
+          if ($out -match 'ModuleNotFoundError|Failed to execute script') {
+            Write-Host $out
+            throw "Backend is missing modules - refusing to publish"
+          }
+          Write-Host "backend smoke test OK"
+
       - name: Build Wails App
         working-directory: antra-wails
         run: wails build -clean
@@ -106,6 +120,15 @@ jobs:
         run: |
           mkdir -p runtime/backend
           pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
+
+      - name: Smoke test backend
+        working-directory: antra-wails
+        run: |
+          out=$(./runtime/backend/AntraBackend "https://open.spotify.com/track/0000000000000000000000" --config /dev/null 2>&1 || true)
+          if echo "$out" | grep -qE 'ModuleNotFoundError|Failed to execute script'; then
+            echo "$out"; echo "Backend is missing modules - refusing to publish"; exit 1
+          fi
+          echo "backend smoke test OK"
 
       - name: Build Wails App
         working-directory: antra-wails
@@ -192,6 +215,15 @@ jobs:
           mkdir -p runtime/backend
           pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
 
+      - name: Smoke test backend
+        working-directory: antra-wails
+        run: |
+          out=$(./runtime/backend/AntraBackend "https://open.spotify.com/track/0000000000000000000000" --config /dev/null 2>&1 || true)
+          if echo "$out" | grep -qE 'ModuleNotFoundError|Failed to execute script'; then
+            echo "$out"; echo "Backend is missing modules - refusing to publish"; exit 1
+          fi
+          echo "backend smoke test OK"
+
       - name: Build Wails App
         working-directory: antra-wails
         run: wails build -clean
@@ -251,6 +283,15 @@ jobs:
         run: |
           mkdir -p runtime/backend
           pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
+
+      - name: Smoke test backend
+        working-directory: antra-wails
+        run: |
+          out=$(./runtime/backend/AntraBackend "https://open.spotify.com/track/0000000000000000000000" --config /dev/null 2>&1 || true)
+          if echo "$out" | grep -qE 'ModuleNotFoundError|Failed to execute script'; then
+            echo "$out"; echo "Backend is missing modules - refusing to publish"; exit 1
+          fi
+          echo "backend smoke test OK"
 
       - name: Build Wails App
         working-directory: antra-wails

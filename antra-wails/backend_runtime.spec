@@ -76,6 +76,19 @@ for package in ("imageio_ffmpeg", "certifi", "lyricsgenius", "spotipy"):
     except Exception:
         pass
 
+# ── Belt-and-braces: ship the antra/antra_shared SOURCE tree as data ────────
+# v1.1.8 shipped THREE times with antra.utils.organizer absent from the PYZ,
+# despite it being an explicit hidden import with no warning emitted. Rather
+# than keep fighting the module graph, also place the real .py files at
+# _MEIPASS/antra/... : PyInstaller sets a frozen package's __path__ to its
+# _MEIPASS directory, so a submodule missing from the PYZ is still importable
+# from disk. If the PYZ has it, the PYZ wins and this costs only a few hundred KB.
+for _pkg in ("antra", "antra_shared"):
+    for _src in sorted((ROOT / _pkg).rglob("*.py")):
+        if "__pycache__" in _src.parts:
+            continue
+        datas.append((str(_src), str(_src.parent.relative_to(ROOT))))
+
 # Explicitly exclude playwright's driver directory (node.exe + JS bundle = ~97 MB).
 # We replaced the playwright session API with raw websockets CDP calls, so node.exe
 # is never executed. The playwright Python package itself is still imported only for
