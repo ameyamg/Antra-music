@@ -66,7 +66,7 @@ func defaultSupportStatus() SupportStatus {
 		Current:  0,
 		Goal:     200,
 		Currency: "USD",
-		Link:     "https://ko-fi.com/antraverse",
+		Link:     "https://patreon.com/AntraVerse",
 	}
 }
 
@@ -138,8 +138,21 @@ func mergeSupportStatus(base SupportStatus, override supportStatusPatch) Support
 	if override.Currency != "" {
 		merged.Currency = override.Currency
 	}
-	if override.Link != "" {
+	if override.Link != "" && !isRetiredFundingLink(override.Link) {
 		merged.Link = override.Link
 	}
 	return merged
+}
+
+// isRetiredFundingLink reports whether a remotely-supplied donation link points
+// at a funding platform that can no longer take money.
+//
+// Ko-fi is dead: the PayPal behind it is permanently restricted (see CLAUDE.md,
+// v1.1.7 Patreon-webhook entry), so a Ko-fi link sends supporters to a funnel
+// that cannot complete. The link normally comes from the remote gist, which is
+// edited independently of releases — so without this guard a build ships
+// correct and silently regresses the moment it reads a stale gist. Falling back
+// to the compiled-in Patreon default is strictly better than honouring it.
+func isRetiredFundingLink(link string) bool {
+	return strings.Contains(strings.ToLower(link), "ko-fi.com")
 }

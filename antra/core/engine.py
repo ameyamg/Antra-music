@@ -3,6 +3,7 @@ Download engine — orchestrates resolve → download → tag → organize.
 """
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -95,6 +96,21 @@ class EngineConfig:
     output_format: str = "source"
     strict_matching: bool = False
     max_workers: int = 1
+    # v1.1.8 FEAT-3 — fail a track rather than keep a lossy substitute when a
+    # lossless format was requested.
+    strict_format: bool = True
+    # v1.1.8 FEAT-2 — never re-encode one lossy format into another.
+    prevent_lossy_transcode: bool = True
+    # v1.1.8 FEAT-4 — stamp ANTRA_VERSION / ANTRA_SOURCE / ANTRA_DOWNLOADED.
+    write_antra_tags: bool = True
+    # Threads that resolve upcoming tracks while other tracks download, so a
+    # download worker never spends its slot on a network search. 0 disables it
+    # and restores the pre-v1.1.8 behaviour exactly.
+    #
+    # Deliberately left at 0 for single-worker (free) runs: with 1 worker a
+    # prefetch thread would double the concurrent request load the mirrors see
+    # from free users, and FEAT-7's rule is that the free tier must not change.
+    prefetch_resolves: int = 0
 
 
 class DownloadEngine:
@@ -110,9 +126,14 @@ class DownloadEngine:
         self.resolver = resolver
         self.organizer = organizer
         self.lyrics = lyrics_fetcher
-        self.tagger = FileTagger()
-        self.transcoder = AudioTranscoder()
+        # cfg MUST be assigned before the tagger/transcoder — both read from it.
         self.cfg = config or EngineConfig()
+        self.tagger = FileTagger(
+            write_antra_tags=getattr(self.cfg, "write_antra_tags", True),
+        )
+        self.transcoder = AudioTranscoder(
+            prevent_lossy_transcode=getattr(self.cfg, "prevent_lossy_transcode", True),
+        )
         self.event_callback = event_callback
         self.controller = controller
         self._emit_lock = threading.Lock()
@@ -125,6 +146,18 @@ class DownloadEngine:
         # 5 minutes so the resolver stops selecting it for subsequent tracks.
         self._adapter_server_errors: dict[str, int] = {}
         self._adapter_server_errors_lock = threading.Lock()
+        # Resolutions computed ahead of time by the prefetcher, keyed by the
+        # 1-based track index. Each entry is consumed exactly once, by the first
+        # resolve attempt for that track (see _take_prefetched).
+        self._prefetched: dict[int, tuple] = {}
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_pool: Optional[ThreadPoolExecutor] = None
+        self._prefetch_stop = threading.Event()
+        # How far behind the current track an unclaimed entry may sit before it
+        # is pruned; set from max_workers when prefetching starts.
+        self._prefetch_slack = 1
+        # Resolves claimed but not yet stored, counted against the queue budget.
+        self._prefetch_inflight = 0
 
     def _signal_output_lost(self, exc: OSError) -> None:
         """Record the first mount-loss error so workers can abort fast."""
@@ -478,6 +511,121 @@ class DownloadEngine:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _container_is_unreadable(file_path: str) -> bool:
+        """True only when a probing tool ran successfully as a process and still
+        could not read an audio duration — i.e. the container is genuinely
+        broken (v1.1.8 BUG-4, the "1.2 MB won't play" stubs).
+
+        Deliberately conservative about the difference between "this file is
+        broken" and "we could not check": if ffprobe is missing, cannot be
+        launched, or times out, this returns False so a working download is
+        never rejected just because the toolchain is unavailable. That
+        distinction is the whole point — `_probe_duration_seconds` collapses
+        both cases to None, which is why an unplayable stub previously sailed
+        through as "nothing to report".
+        """
+        from antra.utils.longpath import extended_path
+        file_path = extended_path(file_path)
+        try:
+            audio = MutagenFile(file_path)
+            if audio is not None and getattr(audio, "info", None) is not None:
+                length = getattr(audio.info, "length", None)
+                if length and float(length) > 0:
+                    return False
+        except Exception:
+            pass
+
+        from antra.utils.runtime import get_ffprobe_exe
+        ffprobe = get_ffprobe_exe() or shutil.which("ffprobe")
+        if not ffprobe:
+            return False  # no tool — cannot judge, so do not reject
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe, "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    file_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except Exception:
+            return False  # could not run it — cannot judge
+        if proc.returncode != 0:
+            return True   # ffprobe ran and rejected the file
+        try:
+            return float(proc.stdout.strip()) <= 0
+        except (TypeError, ValueError):
+            return True   # ran fine but produced no usable duration
+
+    _LOSSLESS_OUTPUT_FORMATS = {
+        "flac", "lossless", "lossless-16", "lossless-24",
+        "alac", "alac-16", "alac-24",
+    }
+
+    def _strict_format_problem(self, file_path: str) -> str | None:
+        """Reject a lossy file delivered under a lossless output format
+        (v1.1.8 FEAT-3).
+
+        This is the "I asked for FLAC 16-bit and got MP3s" report, and it is
+        genuinely part bug: the transcoder deliberately refuses to convert a lossy
+        source into a lossless container (that would fabricate fake lossless, and
+        that refusal is correct) — but nothing then rejected the file, so the
+        lossy download was simply *kept*. The right outcome is to fail the track
+        so another source can be tried, which is what this does.
+        """
+        if not getattr(self.cfg, "strict_format", True):
+            return None
+        target = (self.cfg.output_format or "").lower()
+        if target not in self._LOSSLESS_OUTPUT_FORMATS:
+            return None
+        try:
+            if not self.transcoder._is_lossy(file_path):
+                return None
+        except Exception:
+            return None
+        delivered = os.path.splitext(file_path)[1].lstrip(".").upper() or "lossy"
+        return (
+            f"only a lossy {delivered} copy was available but {target.upper()} was "
+            f"requested — no lossless source had this track"
+        )
+
+    @staticmethod
+    def _final_delivery_problem(file_path: str) -> str | None:
+        """Last gate before a track is counted as delivered (v1.1.8 BUG-6 defect B).
+
+        A track may only be marked done if the file is something Python can
+        actually see and read. This is deliberately narrow — it checks
+        *accessibility*, not tag success: a legitimately unsupported container
+        (`tag_ok = False` on an otherwise perfect file) must still pass, because
+        failing those would regress every format we can download but not tag.
+
+        The case this exists for is a file that is inaccessible to Python while
+        looking fine to ffmpeg — on Windows an over-MAX_PATH path is created and
+        read happily by ffmpeg but raises FileNotFoundError from `open()`,
+        `os.path.getsize()` and mutagen. Previously such a track was tagged
+        (failing with a logged warning) and then still counted as a success.
+        """
+        from antra.utils.longpath import extended_path, path_too_long
+        try:
+            size = os.path.getsize(extended_path(file_path))
+        except OSError as e:
+            if path_too_long(file_path):
+                return (
+                    f"the file path is {len(file_path)} characters, over the Windows "
+                    "260-character limit — choose a shorter music library folder, or "
+                    "shorten the filename template in Settings"
+                )
+            return (
+                f"final file is not accessible ({e.__class__.__name__}: {e.strerror or e})"
+            )
+        if size == 0:
+            return "final file is empty (0 bytes)"
+        return None
+
     @classmethod
     def _is_truncated_download(cls, file_path: str, expected_duration_ms: int | None) -> bool:
         return cls._get_truncation_reason(file_path, expected_duration_ms) is not None
@@ -490,15 +638,35 @@ class DownloadEngine:
         result_duration_ms: int | None = None,
         strict_matching: bool = False,
     ) -> str | None:
-        if not expected_duration_ms or expected_duration_ms < 60000:
-            return None
-
+        # Existence, size-floor and container checks run for EVERY track, including
+        # short ones (v1.1.8 BUG-6). Previously the whole function returned None
+        # for anything under 60s, so a track like a 29-second Goldberg variation
+        # received NO validation at all and a broken 8 KB file was accepted and
+        # reported [Complete]. Duration *comparison* is still skipped for short
+        # tracks (metadata durations are unreliable at that length) — but
+        # "does this file exist and is it plausibly a real audio file" is not a
+        # question we should ever decline to ask.
         tiny_lossless_reason = cls._get_tiny_lossless_file_reason(file_path, expected_duration_ms)
         if tiny_lossless_reason is not None:
             return tiny_lossless_reason
 
+        if not expected_duration_ms or expected_duration_ms < 60000:
+            # Too short for a reliable duration comparison, but we have now
+            # confirmed the file exists and is not implausibly small. Still
+            # verify the container actually decodes before accepting it.
+            if cls._container_is_unreadable(file_path):
+                return "unreadable audio container (truncated or aborted download)"
+            return None
+
         actual_seconds = cls._probe_duration_seconds(file_path)
         if actual_seconds is None:
+            # Container-integrity check (v1.1.8 BUG-4). A file we just downloaded
+            # that no probing tool can read a duration from is a broken container,
+            # not a pass. This is the ~1.2 MB unplayable stub: it clears the size
+            # floor, fails to probe, and previously fell through to the FLAC size
+            # check, which cannot parse it either and so reported nothing wrong.
+            if cls._container_is_unreadable(file_path):
+                return "unreadable audio container (truncated or aborted download)"
             return cls._get_flac_truncation_reason(file_path)
         expected_seconds = expected_duration_ms / 1000.0
 
@@ -512,6 +680,17 @@ class DownloadEngine:
                 and (actual_s - expected_s) >= 45
             )
             return shorter or longer
+
+        # Strict mode: hard duration gate against the REQUESTED metadata, checked
+        # FIRST. This used to sit below the source-consistency early return, which
+        # made it unreachable — the engine passes the downloaded file's own probed
+        # duration as result_duration_ms, so the early return always fired first
+        # and strict mode never rejected a wrong-length delivery (v1.1.8 BUG-1).
+        if strict_matching and not duration_close(expected_seconds, actual_seconds, tolerance=8):
+            return (
+                f"strict duration mismatch: got {actual_seconds:.1f}s "
+                f"but expected {expected_seconds:.1f}s"
+            )
 
         # If the source result reported its own duration and the file matches it,
         # the download is complete — but only when the source duration is itself
@@ -533,30 +712,38 @@ class DownloadEngine:
                 f"but expected {expected_seconds:.1f}s"
             )
 
-        if strict_matching and not duration_close(expected_seconds, actual_seconds, tolerance=8):
-            return (
-                f"strict duration mismatch: got {actual_seconds:.1f}s "
-                f"but expected {expected_seconds:.1f}s"
-            )
-
         # Secondary file-size check for FLAC files.
         return cls._get_flac_truncation_reason(file_path)
 
     @staticmethod
     def _get_tiny_lossless_file_reason(file_path: str, expected_duration_ms: int | None) -> str | None:
-        if not expected_duration_ms or expected_duration_ms < 60000:
-            return None
         if not file_path.lower().endswith((".flac", ".m4a")):
             return None
         try:
-            actual_size = os.path.getsize(file_path)
+            from antra.utils.longpath import extended_path
+            actual_size = os.path.getsize(extended_path(file_path))
         except OSError:
+            # Cannot even stat it — this is never an acceptable delivery. On
+            # Windows this is also how an over-MAX_PATH file presents: ffmpeg can
+            # create it but Python cannot see it at all (v1.1.8 BUG-6).
             return "downloaded file is missing"
+
+        if not expected_duration_ms:
+            return None
 
         expected_seconds = expected_duration_ms / 1000.0
         # A full-length lossless file in the low hundreds of KB is always a bad
         # delivery: preview HTML, an aborted stream, or a header-only container.
-        absolute_floor = 512 * 1024
+        # Short tracks get a proportionally smaller floor rather than being
+        # exempted entirely (v1.1.8 BUG-6): a 29-second FLAC is still megabytes,
+        # so an 8 KB file is unambiguously broken, but a 512 KB floor would be
+        # too aggressive for a genuinely tiny interlude.
+        # For short tracks the per-second term does the work and the absolute
+        # floor is only a backstop against near-empty files. Keeping it at 64 KB
+        # left a genuine 5-second interlude (68 KB) passing by just 4% — too
+        # tight. 16 KB keeps ~4x headroom there while still rejecting the 8 KB
+        # broken deliveries this bug is about.
+        absolute_floor = 512 * 1024 if expected_seconds >= 60 else 16 * 1024
         per_second_floor = expected_seconds * 2 * 1024
         min_expected_size = int(max(absolute_floor, min(per_second_floor, 2 * 1024 * 1024)))
         if actual_size < min_expected_size:
@@ -665,12 +852,72 @@ class DownloadEngine:
     @staticmethod
     def _discard_file(path: str) -> None:
         import os
+        from antra.utils.longpath import extended_path
 
         try:
-            if path and os.path.exists(path):
-                os.remove(path)
+            # extended_path so an over-MAX_PATH file can actually be deleted —
+            # otherwise a partial from a long-path album is undeletable by us and
+            # stays in the library forever (v1.1.8 BUG-6).
+            target = extended_path(path)
+            if target and os.path.exists(target):
+                os.remove(target)
         except OSError:
             pass
+
+    @staticmethod
+    def _output_base_snapshot(output_base: str) -> set[str]:
+        """Files already sitting at this output stem before a download attempt.
+
+        Used to guarantee cleanup (v1.1.8 BUG-4): adapters stream straight into
+        their final path, so an exception mid-transfer leaves a partial file on
+        disk that is never tagged and never removed — which is exactly the
+        reported signature ("the 30-second ones have no metadata"). Snapshotting
+        first means we only ever delete files THIS attempt created, so a
+        previously-completed download is never touched.
+        """
+        import glob
+        import os
+
+        try:
+            return set(glob.glob(glob.escape(output_base) + "*"))
+        except OSError:
+            return set()
+
+    # A leftover we are willing to delete must be exactly the output stem plus a
+    # single short extension, optionally with a .part suffix, or a transcoder
+    # temp. Deliberately strict: a bare "stem*" glob would also match a DIFFERENT
+    # track that merely shares the prefix ("01 - Song.flac" vs
+    # "01 - Song (Live).flac"), and with parallel workers that sibling could be
+    # written by another thread mid-attempt and wrongly deleted.
+    _CLEANUP_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,6}(\.part)?$")
+
+    @classmethod
+    def _cleanup_failed_attempt(cls, output_base: str, before: set[str]) -> None:
+        """Remove any file that appeared at this output stem during a failed
+        download attempt. A file that has not passed validation AND tagging must
+        never be left visible in the library (v1.1.8 BUG-4)."""
+        import glob
+        import os
+
+        try:
+            leftovers = set(glob.glob(glob.escape(output_base) + "*")) - before
+        except OSError:
+            return
+        for stale in leftovers:
+            remainder = stale[len(output_base):]
+            is_temp = remainder.startswith(".antra-convert.")
+            if not is_temp and not cls._CLEANUP_SUFFIX_RE.match(remainder):
+                # Belongs to a different track that happens to share the stem.
+                continue
+            try:
+                if os.path.isfile(stale):
+                    os.remove(stale)
+                    logger.info(
+                        "  [CLEAN] Removed partial file from failed attempt: %s",
+                        os.path.basename(stale),
+                    )
+            except OSError:
+                pass
 
     def download_track(
         self,
@@ -746,12 +993,26 @@ class DownloadEngine:
         while True:
             # 3. Resolve — skip both permanently-excluded and currently rate-limited adapters.
             all_excluded = excluded_adapters | rate_limited_adapters
-            resolution = self.resolver.resolve(track, excluded_adapters=all_excluded)
+            # A prefetched answer is valid only while nothing is excluded — i.e.
+            # the first attempt. Once a source has failed and been excluded, the
+            # precomputed result may well be the one that just failed, so every
+            # later iteration resolves fresh. Popping makes it single-use, so a
+            # retry that leaves the excluded set empty still resolves fresh.
+            prefetched = self._take_prefetched(track_index) if not all_excluded else None
+            if prefetched is not None:
+                # The report was captured in the prefetch thread. It has to be
+                # carried with the resolution because last_resolve_report() is
+                # thread-local — reading it here would return this worker's own,
+                # which never ran a search and is empty.
+                resolution, resolve_report = prefetched
+            else:
+                resolution = self.resolver.resolve(track, excluded_adapters=all_excluded)
+                resolve_report = self.resolver.last_resolve_report()
             # Merge this cycle's search outcomes (no-match / search-error / found)
             # into the running chain. Excluded adapters aren't re-searched, so a
             # prior download-failure reason for them is preserved; the selected
             # adapter's "found" entry is overridden below if its download fails.
-            source_chain.update(self.resolver.last_resolve_report())
+            source_chain.update(resolve_report)
             if not resolution:
                 # Before giving up: if any adapters were rate-limited and haven't
                 # had their one retry yet, unblock them and try again.
@@ -841,6 +1102,9 @@ class DownloadEngine:
 
             for attempt in range(1, self.cfg.max_retries + 1):
                 self._last_attempt_start = time.time()
+                # Snapshot BEFORE the try so the except handler can never see it
+                # unbound, no matter where the attempt fails (v1.1.8 BUG-4).
+                _attempt_snapshot = self._output_base_snapshot(output_base)
                 try:
                     source_text = adapter.name
                     if adapter.name == "soulseek" and result.stream_id:
@@ -848,18 +1112,28 @@ class DownloadEngine:
                         if len(parts) >= 1:
                             source_text = f"soulseek({parts[0]})"
                             
+                    # In Atmos mode the adapter's own label describes what it found
+                    # in the catalogue (FLAC / ALAC), not what is being fetched —
+                    # the ?format=atmos request returns an EC-3 spatial stream. The
+                    # log and the UI badge said "(FLAC)" / "(ALAC 16-bit/44kHz)" for
+                    # Atmos downloads, which read as the feature silently not
+                    # working even on the run that produced a genuine Atmos file.
+                    if (self.cfg.output_format or "").lower().startswith("atmos"):
+                        source_quality = "Dolby Atmos"
+                    else:
+                        source_quality = result.quality_label
+                        if getattr(result, "sample_rate", None):
+                            source_quality += f" / {result.sample_rate / 1000}kHz"
+
                     self._emit(
                         EngineEventType.TRACK_DOWNLOAD_ATTEMPT,
                         track=track,
                         track_index=track_index,
                         track_total=track_total,
                         source=source_text,
-                        quality_label=result.quality_label,
+                        quality_label=source_quality,
                         attempt=attempt,
                     )
-                    source_quality = result.quality_label
-                    if getattr(result, "sample_rate", None):
-                        source_quality += f" / {result.sample_rate / 1000}kHz"
 
                     if attempt == 1:
                         logger.info(
@@ -904,6 +1178,16 @@ class DownloadEngine:
                                 f"  [FMT]  Format conversion skipped ({conv_err}) — "
                                 f"keeping source file: {candidate_path}"
                             )
+                    # FEAT-3: a lossy file delivered under a lossless output
+                    # format must fail the track, not be silently kept. Checked
+                    # after conversion so an ALAC→FLAC style remux has already
+                    # happened and only a genuinely lossy delivery is rejected.
+                    strict_format_reason = self._strict_format_problem(candidate_path)
+                    if strict_format_reason is not None:
+                        self._discard_file(candidate_path)
+                        raise RuntimeError(
+                            f"[{adapter.name}] {strict_format_reason}"
+                        )
                     truncation_reason = self._get_truncation_reason(
                         candidate_path,
                         track.duration_ms,
@@ -947,6 +1231,16 @@ class DownloadEngine:
                 except Exception as e:
                     if _is_mount_lost_error(e):
                         self._signal_output_lost(e)
+                    else:
+                        # Guarantee cleanup on EVERY failure path (v1.1.8 BUG-4).
+                        # Adapters that stream straight into their final path
+                        # (qobuz, qobuz_mirror, apple) leave a partial file behind
+                        # when the transfer dies mid-stream; it is never tagged and
+                        # was never removed, so it stayed in the library looking
+                        # like a successful — but metadata-less — 30s/stub track.
+                        # Skipped when the output mount vanished: the files may
+                        # still be intact and simply unreachable right now.
+                        self._cleanup_failed_attempt(output_base, _attempt_snapshot)
                     final_error = e
                     last_error = str(e)
                     last_source = adapter.name
@@ -984,6 +1278,31 @@ class DownloadEngine:
                         time.sleep(self.cfg.retry_delay)
                         continue
                     break
+
+            # Final delivery gate (v1.1.8 BUG-6 defect B). A track must never be
+            # counted as done when the file is not actually readable from Python.
+            # Setting file_path = None here deliberately falls through to the
+            # adapter-exclusion logic below and re-resolves against the next
+            # source — the same graceful path a download failure takes. It is NOT
+            # raised, because this block is not inside a try and an exception here
+            # would escape download_track and take the worker with it.
+            if file_path:
+                delivery_problem = self._final_delivery_problem(file_path)
+                if delivery_problem:
+                    logger.warning(
+                        f"  [WARN]  {adapter.name} delivery rejected for '{track.title}': "
+                        f"{delivery_problem} — discarding and trying the next source"
+                    )
+                    self._discard_file(file_path)
+                    self._cleanup_failed_attempt(output_base, _attempt_snapshot)
+                    self.resolver.record_outcome(adapter.name, False)
+                    final_error = RuntimeError(f"[{adapter.name}] {delivery_problem}")
+                    last_error = str(final_error)
+                    last_source = adapter.name
+                    if adapter.name not in attempted_sources:
+                        attempted_sources.append(adapter.name)
+                    source_chain[adapter.name] = "delivered an unreadable file"
+                    file_path = None
 
             if file_path:
                 # 4. Enrich metadata from winning adapter + free APIs + lyrics + art
@@ -1147,6 +1466,148 @@ class DownloadEngine:
             else:
                 logger.info(f"  [NEXT]  {adapter.name} candidate failed, trying another match from the same source...")
 
+    # ------------------------------------------------------------------
+    # Resolve prefetch
+    #
+    # A download worker used to run resolve -> download -> tag inline, so a
+    # worker busy searching the mirrors was not moving any bytes. With N workers
+    # the actual number of concurrent transfers was therefore
+    # N x download_time / (resolve_time + download_time) — visibly fewer than N.
+    #
+    # These helpers resolve upcoming tracks on a small side pool so the download
+    # workers find their answer already waiting. The retry/exclusion loop in
+    # download_track is untouched: a prefetched answer is only ever used for the
+    # FIRST resolve of a track, which is the only point at which the excluded set
+    # is empty and a precomputed result is therefore still valid.
+    #
+    # Safe to hold: no adapter returns a signed URL from search() (all 22 call
+    # sites pass download_url=None), so a resolution is just "which adapter,
+    # which id" and cannot go stale while it waits in the map.
+    # ------------------------------------------------------------------
+
+    def _take_prefetched(self, track_index: Optional[int]) -> Optional[tuple]:
+        """Consume the prefetched resolution for a track, if one is ready."""
+        if not track_index:
+            return None
+        with self._prefetch_lock:
+            entry = self._prefetched.pop(track_index, None)
+            # Drop anything left behind the pack. A worker that resolved a track
+            # itself (because it got there first) would otherwise leave an entry
+            # nobody can ever claim, silently eating the lookahead budget and
+            # throttling the prefetcher down to nothing.
+            stale = [k for k in self._prefetched if k < track_index - self._prefetch_slack]
+            for k in stale:
+                self._prefetched.pop(k, None)
+            return entry
+
+    def _prefetch_worker(self, tracks: list[TrackMetadata], counter: list, lookahead: int) -> None:
+        while not self._prefetch_stop.is_set():
+            if self._output_lost.is_set():
+                return
+            if self.controller:
+                self.controller.wait_if_paused()
+                if self.controller.is_cancelled():
+                    return
+
+            # Back-pressure and the index claim share one lock acquisition. Split
+            # across two, several threads pass the depth check together and each
+            # then adds an entry, overshooting the bound by one per thread.
+            with self._prefetch_lock:
+                # Count in-flight resolves against the budget too. Checking only
+                # the map lets every thread claim while the map is still short,
+                # and the bound is then overshot by one per thread once they all
+                # store their result.
+                if len(self._prefetched) + self._prefetch_inflight >= lookahead:
+                    index = None
+                else:
+                    index = counter[0]
+                    counter[0] += 1
+                    self._prefetch_inflight += 1
+            if index is None:
+                time.sleep(0.15)
+                continue
+            if index >= len(tracks):
+                with self._prefetch_lock:
+                    self._prefetch_inflight -= 1
+                return
+
+            track = tracks[index]
+            # try/finally around the whole claim: every path out of here —
+            # already-downloaded, resolve error, no match — must release the
+            # in-flight slot, or the budget drains and prefetching stops dead.
+            try:
+                try:
+                    # A track already on disk is skipped before it ever resolves,
+                    # so resolving it here would be pure waste.
+                    if self.organizer.is_already_downloaded(track):
+                        continue
+                except Exception:
+                    pass
+
+                try:
+                    resolution = self.resolver.resolve(track, excluded_adapters=set())
+                    # last_resolve_report() is thread-local, so it must be
+                    # captured here, in the thread that did the resolving.
+                    # Reading it later from the download worker would return
+                    # that worker's own report, which never ran a search.
+                    report = dict(self.resolver.last_resolve_report() or {})
+                except Exception as exc:
+                    logger.debug(f"  [PREFETCH]  resolve failed for '{track.title}': {exc}")
+                    continue
+
+                # Deliberately only cache a hit. A miss is often transient (a
+                # mirror briefly unreachable), and caching it would fail the
+                # track without the fresh attempt it would have had before.
+                if resolution is None:
+                    continue
+
+                with self._prefetch_lock:
+                    self._prefetched[index + 1] = (resolution, report)
+            finally:
+                with self._prefetch_lock:
+                    self._prefetch_inflight -= 1
+
+    def _start_prefetch(self, tracks: list[TrackMetadata]) -> None:
+        threads = max(0, int(getattr(self.cfg, "prefetch_resolves", 0) or 0))
+        if threads <= 0 or len(tracks) < 2:
+            return
+        threads = min(threads, len(tracks) - 1)
+        workers = max(1, int(self.cfg.max_workers))
+        lookahead = max(2, workers + 2)
+
+        # Start PAST the tracks the download workers claim the instant the pool
+        # opens. Starting at 0 makes the prefetcher race the workers for the same
+        # first N tracks, lose (they are already resolving inline), and throw all
+        # of that work away — measured as exactly zero cache hits.
+        start = min(workers, len(tracks) - 1)
+        self._prefetch_slack = workers
+
+        self._prefetch_stop.clear()
+        with self._prefetch_lock:
+            self._prefetched.clear()
+            self._prefetch_inflight = 0
+
+        counter = [start]
+        self._prefetch_pool = ThreadPoolExecutor(
+            max_workers=threads, thread_name_prefix="antra-prefetch"
+        )
+        for _ in range(threads):
+            self._prefetch_pool.submit(self._prefetch_worker, tracks, counter, lookahead)
+        logger.info(
+            f"  [PREFETCH]  Resolving ahead on {threads} thread(s), "
+            f"queue depth {lookahead} — download slots stay busy."
+        )
+
+    def _stop_prefetch(self) -> None:
+        self._prefetch_stop.set()
+        pool, self._prefetch_pool = self._prefetch_pool, None
+        if pool is not None:
+            # Do not block on in-flight resolves: a mirror search can sit on a
+            # long timeout, and the user cancelling must not wait for it.
+            pool.shutdown(wait=False)
+        with self._prefetch_lock:
+            self._prefetched.clear()
+
     def download_playlist(self, tracks: list[TrackMetadata]) -> list[DownloadResult]:
         """Download all tracks in a playlist in parallel, returning results in original order."""
         total = len(tracks)
@@ -1166,7 +1627,7 @@ class DownloadEngine:
                 return index, DownloadResult(
                     track=track,
                     status=DownloadStatus.FAILED,
-                    error=self._output_lost_message,
+                    error_message=self._output_lost_message,
                 )
             if self.controller:
                 self.controller.wait_if_paused()
@@ -1174,7 +1635,7 @@ class DownloadEngine:
                     return index, DownloadResult(
                         track=track,
                         status=DownloadStatus.CANCELLED,
-                        error="Cancelled",
+                        error_message="Cancelled",
                     )
             logger.info(f"[{index + 1}/{total}] {track.artist_string} — {track.title}")
             self._emit(
@@ -1186,32 +1647,44 @@ class DownloadEngine:
             return index, self.download_track(track, track_index=index + 1, track_total=total)
 
         workers = max(1, self.cfg.max_workers)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_worker, i, track): i for i, track in enumerate(tracks)}
-            for future in as_completed(futures):
-                if self.controller and self.controller.is_cancelled():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    break
-                try:
-                    idx, result = future.result()
-                    results[idx] = result
-                except OSError as e:
-                    idx = futures[future]
-                    if _is_mount_lost_error(e):
-                        self._signal_output_lost(e)
-                    results[idx] = DownloadResult(
-                        track=tracks[idx],
-                        status=DownloadStatus.FAILED,
-                        error=self._output_lost_message if self._output_lost.is_set() else str(e),
-                    )
-                except Exception as e:
-                    idx = futures[future]
-                    logger.warning(f"Worker for track {idx + 1} raised unexpectedly: {e}")
-                    results[idx] = DownloadResult(
-                        track=tracks[idx],
-                        status=DownloadStatus.FAILED,
-                        error=str(e),
-                    )
+        # Resolve ahead of the downloaders so a worker's slot is spent moving
+        # bytes rather than searching. try/finally, not a bare call after the
+        # pool: the side threads must not outlive this call on any exit path.
+        self._start_prefetch(tracks)
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_worker, i, track): i for i, track in enumerate(tracks)}
+                for future in as_completed(futures):
+                    if self.controller and self.controller.is_cancelled():
+                        self._stop_prefetch()
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+                    try:
+                        idx, result = future.result()
+                        results[idx] = result
+                    except OSError as e:
+                        idx = futures[future]
+                        if _is_mount_lost_error(e):
+                            self._signal_output_lost(e)
+                        results[idx] = DownloadResult(
+                            track=tracks[idx],
+                            status=DownloadStatus.FAILED,
+                            error_message=(
+                                self._output_lost_message
+                                if self._output_lost.is_set()
+                                else str(e)
+                            ),
+                        )
+                    except Exception as e:
+                        idx = futures[future]
+                        logger.warning(f"Worker for track {idx + 1} raised unexpectedly: {e}")
+                        results[idx] = DownloadResult(
+                            track=tracks[idx],
+                            status=DownloadStatus.FAILED,
+                            error_message=str(e),
+                        )
+        finally:
+            self._stop_prefetch()
 
         # Fill any slots that were cancelled or never completed
         final: list[DownloadResult] = []
@@ -1220,7 +1693,7 @@ class DownloadEngine:
                 r = DownloadResult(
                     track=tracks[i],
                     status=DownloadStatus.CANCELLED,
-                    error="Cancelled",
+                    error_message="Cancelled",
                 )
             final.append(r)
 

@@ -46,12 +46,16 @@ export function GetConfig() {
   return window['go']['main']['App']['GetConfig']();
 }
 
-export function GetDiscoveryData(arg1, arg2, arg3) {
-  return window['go']['main']['App']['GetDiscoveryData'](arg1, arg2, arg3);
+export function GetDeviceAccountStatus() {
+  return window['go']['main']['App']['GetDeviceAccountStatus']();
 }
 
-export function GetDiscoveryGenres(arg1) {
-  return window['go']['main']['App']['GetDiscoveryGenres'](arg1);
+export function GetDiscoveryData(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['GetDiscoveryData'](arg1, arg2, arg3, arg4);
+}
+
+export function GetDiscoveryGenres(arg1, arg2) {
+  return window['go']['main']['App']['GetDiscoveryGenres'](arg1, arg2);
 }
 
 export function GetDownloadedMusicLibrary() {
@@ -110,6 +114,14 @@ export function PickDirectory() {
   return window['go']['main']['App']['PickDirectory']();
 }
 
+export function PollDeviceLogin(arg1) {
+  return window['go']['main']['App']['PollDeviceLogin'](arg1);
+}
+
+export function RenewDeviceTokenIfNeeded() {
+  return window['go']['main']['App']['RenewDeviceTokenIfNeeded']();
+}
+
 export function RetryTrackDownload(arg1) {
   return window['go']['main']['App']['RetryTrackDownload'](arg1);
 }
@@ -142,6 +154,10 @@ export function SetSpotifyToken(arg1) {
   return window['go']['main']['App']['SetSpotifyToken'](arg1);
 }
 
+export function SignOutDevice() {
+  return window['go']['main']['App']['SignOutDevice']();
+}
+
 export function StartAmazonBrowserLogin() {
   return window['go']['main']['App']['StartAmazonBrowserLogin']();
 }
@@ -150,12 +166,20 @@ export function StartAppleBrowserLogin() {
   return window['go']['main']['App']['StartAppleBrowserLogin']();
 }
 
+export function StartDeviceLogin() {
+  return window['go']['main']['App']['StartDeviceLogin']();
+}
+
 export function StartDownload(arg1) {
   return window['go']['main']['App']['StartDownload'](arg1);
 }
 
 export function StartTidalOAuthLogin() {
   return window['go']['main']['App']['StartTidalOAuthLogin']();
+}
+
+export function ValidateKey(arg1) {
+  return window['go']['main']['App']['ValidateKey'](arg1);
 }
 
 export function ValidateTidalAuth() {

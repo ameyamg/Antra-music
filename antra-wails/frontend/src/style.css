@@ -1,3 +1,22 @@
+/* ── Typefaces (v1.1.8 FEAT-10) ──────────────────────────────────────────────
+   Both faces are bundled, never fetched — the app must render identically
+   offline, and Wails gives no network guarantee at startup. */
+@font-face {
+  font-family: 'OpenDyslexic';
+  src: url('./assets/fonts/OpenDyslexicAlta-Regular.otf') format('opentype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Nunito';
+  src: url('./assets/fonts/nunito-v16-latin-regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+
 /* ── Default theme (Antra) ───────────────────────────────────────────────── */
 :root,
 :root[data-theme="antra"] {
@@ -24,9 +43,14 @@
   --error-color: #ff5555;
   --border-radius: 8px;
   --font-mono: 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+  /* The app shell reads --font-ui; --font-mono stays genuinely monospace for
+     the log panel and technical readouts, where column alignment matters.
+     Default is the mono stack, so an install with no font preference set
+     renders byte-identically to before this feature. */
+  --font-ui: var(--font-mono);
   background-color: var(--bg-color);
   color: var(--fg-color);
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
   font-size: 14px;
   line-height: 1.5;
   margin: 0;
@@ -356,6 +380,33 @@
   color: var(--fg-color);
 }
 
+/* ── Typeface options (v1.1.8 FEAT-10) ───────────────────────────────────────
+   Applied as data-font on <html>, exactly like data-theme. Deliberately an
+   attribute and not a class, so it cannot collide with the theme classes. */
+
+/* Follow the OS. system-ui resolves to Segoe UI Variable on Win11, SF on
+   macOS, and the desktop's configured UI font on Linux. */
+:root[data-font="system"] {
+  --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+:root[data-font="nunito"] {
+  --font-ui: 'Nunito', system-ui, sans-serif;
+}
+
+/* OpenDyslexic is an accessibility choice, so it deliberately overrides
+   --font-mono as well: a reader who needs this face needs it in the activity
+   log too, and readability outweighs column alignment there. Its glyphs are
+   bottom-weighted and run large, so the base size is nudged down to keep the
+   same amount of text on screen. */
+:root[data-font="dyslexic"] {
+  --font-ui: 'OpenDyslexic', 'Comic Sans MS', system-ui, sans-serif;
+  --font-mono: 'OpenDyslexic', 'Consolas', monospace;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+}
+
+
 body {
   margin: 0;
   display: flex;
@@ -380,7 +431,7 @@ body {
 }
 
 input, button {
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
 }
 
 button {

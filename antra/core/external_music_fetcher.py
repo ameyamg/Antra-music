@@ -295,6 +295,13 @@ class ExternalMusicFetcher:
 
         return self._fetch_qobuz_via_mirror(kind, item_id)
 
+    # Must stay ABOVE the mirror's own rotation budget (QOBUZ_ROTATION_BUDGET_S,
+    # 25s). Qobuz album ids are region-scoped, so the mirror walks its account
+    # pool until a region that holds the id answers — measured worst case 28s.
+    # At the previous 20s this client aborted first and surfaced a bare
+    # "Read timed out" instead of the mirror's own explanatory error.
+    _QOBUZ_MIRROR_TIMEOUT = 45
+
     def _fetch_qobuz_via_mirror(self, kind: str, item_id: str) -> list[TrackMetadata]:
         """Fetch Qobuz metadata via the VPS mirror — no local credentials required."""
         from antra.core.endpoint_manifest import load_endpoint_manifest
@@ -319,7 +326,7 @@ class ExternalMusicFetcher:
             if kind == "album":
                 r = self._session.get(
                     f"{mirror_url}/api/album/{item_id}",
-                    headers=headers, timeout=20,
+                    headers=headers, timeout=self._QOBUZ_MIRROR_TIMEOUT,
                 )
                 if r.status_code == 404:
                     raise RuntimeError(f"Album {item_id} not found on Qobuz")
@@ -328,7 +335,7 @@ class ExternalMusicFetcher:
             elif kind == "track":
                 r = self._session.get(
                     f"{mirror_url}/api/meta/track/{item_id}",
-                    headers=headers, timeout=20,
+                    headers=headers, timeout=self._QOBUZ_MIRROR_TIMEOUT,
                 )
                 if r.status_code == 404:
                     raise RuntimeError(f"Track {item_id} not found on Qobuz")
@@ -339,7 +346,7 @@ class ExternalMusicFetcher:
             elif kind == "playlist":
                 r = self._session.get(
                     f"{mirror_url}/api/playlist/{item_id}",
-                    headers=headers, timeout=20,
+                    headers=headers, timeout=self._QOBUZ_MIRROR_TIMEOUT,
                 )
                 if r.status_code == 404:
                     raise RuntimeError(f"Playlist {item_id} not found on Qobuz")
@@ -370,7 +377,9 @@ class ExternalMusicFetcher:
         except Exception as e:
             raise RuntimeError(
                 f"Could not fetch Qobuz metadata via mirror for {kind}/{item_id}: {e}. "
-                "Add Qobuz credentials in Settings for reliable access."
+                "Qobuz ids are region-scoped, so an id copied from one storefront's "
+                "URL may not exist in another region's catalog — try the same release "
+                "from a different Qobuz storefront, or use a Spotify/Apple link instead."
             ) from e
 
         album_title = data.get("title", "")

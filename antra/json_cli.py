@@ -54,6 +54,12 @@ def _extract_mutagen_tags(tags) -> dict:
             ("album",  ["album",  "ALBUM"]),
             ("tracknumber", ["tracknumber", "TRACKNUMBER"]),
             ("date",   ["date", "DATE", "year", "YEAR"]),
+            # Lyrics are read back by the desktop player (GetTrackLyrics). Without
+            # them here the mutagen fallback silently returns a lyrics-less probe
+            # on any machine with no system ffprobe — which is every clean install,
+            # since imageio_ffmpeg ships ffmpeg only.
+            ("LYRICS",  ["lyrics", "LYRICS", "unsyncedlyrics", "UNSYNCEDLYRICS",
+                         "syncedlyrics", "SYNCEDLYRICS"]),
         ]:
             for k in candidates:
                 v = tags.get(k)
@@ -71,12 +77,21 @@ def _extract_mutagen_tags(tags) -> dict:
             if frames:
                 v = frames[0]
                 result[field] = str(v.text[0]) if hasattr(v, "text") and v.text else str(v)
+        # USLT is handled separately: unlike the frames above, its .text is a
+        # plain string, so v.text[0] would yield the first CHARACTER.
+        for frame in tags.getall("USLT"):
+            body = getattr(frame, "text", "")
+            if isinstance(body, (list, tuple)):
+                body = body[0] if body else ""
+            if str(body).strip():
+                result["LYRICS"] = str(body)
+                break
 
     # MP4/M4A – dict-like but with Apple four-char keys
     if not result and hasattr(tags, "items"):
         mp4_map = {
             "\xa9nam": "title", "\xa9ART": "artist", "\xa9alb": "album",
-            "trkn": "tracknumber", "\xa9day": "date",
+            "trkn": "tracknumber", "\xa9day": "date", "\xa9lyr": "LYRICS",
         }
         for k, field in mp4_map.items():
             v = tags.get(k)
@@ -2354,6 +2369,24 @@ def _persist_tracked_playlists(tracked: list) -> None:
         logger.warning("Could not persist tracked_playlists to config: %s", e)
 
 
+def _sp_dc_from(args) -> str:
+    """Read the Spotify session cookie for the early-exit subcommands.
+
+    These branches (discovery, genres) run BEFORE the block that maps config
+    settings into os.environ, so reading SPOTIFY_SP_DC from the environment
+    here silently yields nothing and Discover would always fall back to Apple.
+    Read the config file directly, with the env var as a fallback.
+    """
+    cfg_path = getattr(args, "config", "") or ""
+    if cfg_path and os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                return (json.load(f).get("spotify_sp_dc") or "").strip()
+        except Exception:
+            pass
+    return (os.environ.get("SPOTIFY_SP_DC") or "").strip()
+
+
 def main():
 
     _start_time = time.time()
@@ -2362,6 +2395,9 @@ def main():
     parser.add_argument("--config", help="Path to config.json from Go launcher")
     parser.add_argument("--get-ffmpeg-dir", action="store_true",
                         help="Print the paths to bundled ffmpeg/ffprobe (two lines) and exit")
+    parser.add_argument("--export-ffmpeg", metavar="DIR",
+                        help="Copy the bundled ffmpeg/ffprobe into DIR and print their "
+                             "persistent paths (two lines), then exit")
     parser.add_argument("--probe", metavar="FILE",
                         help="Run ffprobe on FILE and print JSON metadata, then exit")
     parser.add_argument("--spectrogram", metavar="FILE",
@@ -2380,6 +2416,8 @@ def main():
                         help="Fetch discovery data (Top Albums/Playlists) and exit")
     parser.add_argument("--discovery-region", default="us",
                         help="Storefront region for discovery data")
+    parser.add_argument("--discovery-source", default="apple", choices=["apple", "spotify"],
+                        help="Which service supplies discovery data")
     parser.add_argument("--discovery-genre-id", default="",
                         help="Genre ID for discovery data")
     parser.add_argument("--discovery-genre-name", default="",
@@ -2404,6 +2442,16 @@ def main():
                         help="Run auto-sync: download new tracks from all tracked playlists, then exit")
     args = parser.parse_args()
 
+    # Several subcommands (discovery, artist search, discography) exit before the
+    # block further down that maps config settings into os.environ. Any of them
+    # that needs the Spotify session would otherwise read an empty SPOTIFY_SP_DC
+    # and silently fall back to Apple Music while looking like it worked. Publish
+    # it up front so load_config() sees it on every path.
+    if not (os.environ.get("SPOTIFY_SP_DC") or "").strip():
+        _early_sp_dc = _sp_dc_from(args)
+        if _early_sp_dc:
+            os.environ["SPOTIFY_SP_DC"] = _early_sp_dc
+
     ensure_runtime_environment()
 
     if args.discography:
@@ -2421,6 +2469,31 @@ def main():
                 manifest = load_endpoint_manifest()
                 fetcher = AmazonMusicFetcher(mirrors=cfg.amazon_mirrors or manifest.amazon)
                 info = fetcher.fetch_artist_discography_info(url)
+            elif "open.spotify.com" in url and "/artist/" in url:
+                # Partner GraphQL first: the public API 429s on throttled networks,
+                # which would otherwise surface as an empty or failed discography
+                # for an artist Spotify plainly has. Falls through to the public
+                # client below only if this path fails.
+                from antra.core.config import load_config
+                cfg = load_config()
+                sp_dc = (getattr(cfg, "spotify_sp_dc", "") or "").strip() or _sp_dc_from(args)
+                info = None
+                if sp_dc:
+                    try:
+                        from antra.core.spotify_partner import SpotifyPartnerClient
+                        info = SpotifyPartnerClient(sp_dc).fetch_artist_discography_info(url)
+                    except Exception:
+                        info = None
+                if not info or not info.get("albums"):
+                    from antra.core.spotify import SpotifyClient
+                    sp = SpotifyClient(
+                        cfg.spotify_client_id,
+                        cfg.spotify_client_secret,
+                        cfg.spotify_market,
+                        redirect_uri=cfg.spotify_redirect_uri,
+                        auth_storage_path=cfg.spotify_auth_path,
+                    )
+                    info = sp.fetch_artist_discography_info(url)
             else:
                 from antra.core.config import load_config
                 from antra.core.spotify import SpotifyClient
@@ -2463,22 +2536,43 @@ def main():
     if args.discovery_json:
         try:
             from antra.core.discovery import AppleDiscovery
-            d = AppleDiscovery()
-            data = d.get_discovery_data(
-                storefront=args.discovery_region,
-                genre_id=args.discovery_genre_id if args.discovery_genre_id else None,
-                genre_name=args.discovery_genre_name if args.discovery_genre_name else None
-            )
-            print(json.dumps({"type": "discovery", "data": data}), flush=True)
+            data = None
+            source = "apple"
+            if args.discovery_source == "spotify":
+                sp_dc = _sp_dc_from(args)
+                if sp_dc:
+                    from antra.core.discovery import SpotifyDiscovery
+                    data = SpotifyDiscovery(sp_dc).get_discovery_data(
+                        storefront=args.discovery_region
+                    )
+                    # The home feed is personalised and unavailable logged-out;
+                    # an empty result also covers a rotated persisted-query hash.
+                    # Either way fall back rather than show an empty tab.
+                    if data.get("top_albums") or data.get("top_playlists"):
+                        source = "spotify"
+                    else:
+                        data = None
+            if data is None:
+                data = AppleDiscovery().get_discovery_data(
+                    storefront=args.discovery_region,
+                    genre_id=args.discovery_genre_id if args.discovery_genre_id else None,
+                    genre_name=args.discovery_genre_name if args.discovery_genre_name else None
+                )
+            print(json.dumps({"type": "discovery", "data": data, "source": source}), flush=True)
         except Exception as e:
             print(json.dumps({"type": "error", "message": str(e)}), flush=True)
         sys.exit(0)
 
     if args.discovery_genres_only:
         try:
-            from antra.core.discovery import AppleDiscovery
-            d = AppleDiscovery()
-            genres = d.get_genres(storefront=args.discovery_region)
+            # Spotify's home feed has no genre facet, so it reports no genres and
+            # the UI hides the picker. Apple keeps its chart genres.
+            if args.discovery_source == "spotify" and _sp_dc_from(args):
+                from antra.core.discovery import SpotifyDiscovery
+                genres = SpotifyDiscovery(_sp_dc_from(args)).get_genres()
+            else:
+                from antra.core.discovery import AppleDiscovery
+                genres = AppleDiscovery().get_genres(storefront=args.discovery_region)
             print(json.dumps({"type": "discovery_genres", "data": genres}), flush=True)
         except Exception as e:
             print(json.dumps({"type": "error", "message": str(e)}), flush=True)
@@ -2542,6 +2636,16 @@ def main():
         ffmpeg = get_ffmpeg_exe()
         ffprobe = get_ffprobe_exe()
         # Output two lines: ffmpeg full path, ffprobe full path (empty if not found)
+        # NOTE: inside the PyInstaller bundle these may point into _MEIPASS, which
+        # is deleted when this process exits. Callers that need a path they can
+        # exec LATER must use --export-ffmpeg instead.
+        print(ffmpeg or "")
+        print(ffprobe or "")
+        sys.exit(0)
+
+    if args.export_ffmpeg:
+        from antra.utils.runtime import export_runtime_binaries
+        ffmpeg, ffprobe = export_runtime_binaries(args.export_ffmpeg)
         print(ffmpeg or "")
         print(ffprobe or "")
         sys.exit(0)
@@ -2635,7 +2739,33 @@ def main():
                 os.environ["AMAZON_WVD_PATH"] = str(settings.get("amazon_wvd_path") or "")
 
             if "output_format" in settings and settings["output_format"]:
-                os.environ["OUTPUT_FORMAT"] = settings["output_format"]
+                _fmt = settings["output_format"]
+                # v1.1.8 FEAT-1: resolve the unified "atmos" choice to a concrete
+                # atmos-<service> using the pasted URL, since the Atmos mix is
+                # service-specific. Done here because this is the first point
+                # where BOTH the chosen format and the URL are known. A link from
+                # a non-Atmos service fails loudly rather than silently
+                # downloading a stereo copy.
+                if str(_fmt).lower() == "atmos":
+                    from antra.core.service import detect_atmos_service
+                    _urls = [u for u in (getattr(args, "playlists", None) or []) if u]
+                    _services = {detect_atmos_service(u) for u in _urls}
+                    if not _urls or None in _services or not _services:
+                        print(json.dumps({"type": "error", "message":
+                            "Dolby Atmos is only available from Tidal, Apple Music or Amazon "
+                            "Music. Paste a link from one of those services to download an "
+                            "Atmos mix."}), flush=True)
+                        sys.exit(1)
+                    if len(_services) > 1:
+                        # One run has one output format, and the Atmos mix is
+                        # service-specific — mixing services cannot be honoured.
+                        print(json.dumps({"type": "error", "message":
+                            "Dolby Atmos downloads can only cover one service at a time. "
+                            "Paste links from a single service (Tidal, Apple Music or "
+                            "Amazon Music) per download."}), flush=True)
+                        sys.exit(1)
+                    _fmt = f"atmos-{_services.pop()}"
+                os.environ["OUTPUT_FORMAT"] = _fmt
             if "max_retries" in settings:
                 os.environ["MAX_RETRIES"] = str(settings["max_retries"])
 
@@ -2663,7 +2793,14 @@ def main():
             os.environ["SINGLE_TRACK_FILENAME_TEMPLATE"] = settings.get("single_track_filename_template") or ""
             os.environ["ALBUM_ZIP_NAME_TEMPLATE"] = settings.get("album_zip_name_template") or ""
             os.environ["ALBUM_TRACK_FILENAME_TEMPLATE"] = settings.get("album_track_filename_template") or ""
-            os.environ["FOLDER_STRUCTURE_TEMPLATE"] = settings.get("folder_structure_template") or ""
+            # v1.1.8 FEAT-11 — tri-state. The Go side sends the key only when the
+            # user has touched it (*string), so: absent/None = never configured
+            # (use the default), "" = deliberately cleared (flat library root),
+            # anything else = a real template. Set unconditionally so a stale
+            # .env value can never win (the BUG-23 trap).
+            _fst = settings.get("folder_structure_template")
+            os.environ["FOLDER_STRUCTURE_TEMPLATE"] = _fst or ""
+            os.environ["FLAT_LIBRARY_ROOT"] = "true" if _fst == "" else "false"
             os.environ["MULTI_DISC_HANDLING"] = settings.get("multi_disc_handling") or "prefix"
             os.environ["TRACK_NUMBER_PADDING"] = str(settings.get("track_number_padding") or 2)
             illegal_character_replacement = settings.get("illegal_character_replacement")
@@ -2676,6 +2813,17 @@ def main():
                 os.environ["PREFER_EXPLICIT"] = "true" if settings["prefer_explicit"] else "false"
             if "strict_matching" in settings:
                 os.environ["STRICT_MATCHING"] = "true" if settings["strict_matching"] else "false"
+            # v1.1.8 FEAT-2/3/4. Set unconditionally with their documented
+            # defaults: an absent key in an older config.json must not leave the
+            # env var unset and let a stale .env value win — that is exactly the
+            # trap that caused BUG-23 for the filename-format setting.
+            os.environ["STRICT_FORMAT"] = "true" if settings.get("strict_format", True) else "false"
+            os.environ["PREVENT_LOSSY_TRANSCODE"] = (
+                "true" if settings.get("prevent_lossy_transcode", True) else "false"
+            )
+            os.environ["WRITE_ANTRA_TAGS"] = (
+                "true" if settings.get("write_antra_tags", True) else "false"
+            )
 
             # API key for self-hosted mirror servers
             if settings.get("antra_api_key") is not None:
@@ -2803,6 +2951,7 @@ def main():
                 single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
                 album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
                 folder_structure_template=getattr(cfg, "folder_structure_template", ""),
+                flat_library_root=getattr(cfg, "flat_library_root", False),
                 multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
                 track_number_padding=getattr(cfg, "track_number_padding", 2),
                 illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
@@ -2854,6 +3003,7 @@ def main():
             single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
             album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
             folder_structure_template=getattr(cfg, "folder_structure_template", ""),
+            flat_library_root=getattr(cfg, "flat_library_root", False),
             multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
             track_number_padding=getattr(cfg, "track_number_padding", 2),
             illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),

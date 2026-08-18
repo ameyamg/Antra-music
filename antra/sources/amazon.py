@@ -44,12 +44,141 @@ def _humanize_amazon_error(message: str) -> str:
         return "[Amazon] Amazon returned an unreadable protected audio stream for this track."
     if "token expired or geo-restricted" in lowered:
         return "[Amazon] Amazon could not serve this track right now (token expired or region restricted)."
+    # TLS / connectivity failures (v1.1.8 BUG-2). A raw
+    # "SSLError(SSLError(1, '[SSL: WRONG_VERSION_NUMBER]...'))" blob tells a user
+    # nothing and reads like a server outage, which is the wrong conclusion —
+    # WRONG_VERSION_NUMBER means the bytes coming back are not TLS at all, so
+    # something on the network path (proxy, captive portal, ISP interception, or
+    # a plaintext port behind an https:// URL) answered instead of the mirror.
+    if "wrong_version_number" in lowered or "record layer failure" in lowered:
+        return (
+            "[Amazon] Could not establish a secure connection to the Amazon mirror. "
+            "The server replied with something that isn't HTTPS — this is almost always a "
+            "network issue on your side (a VPN, proxy, corporate firewall, or public Wi-Fi "
+            "portal intercepting the connection), not a server outage. Try disabling any "
+            "proxy/VPN, or switching network."
+        )
+    if "certificate verify failed" in lowered or "certificate_verify_failed" in lowered:
+        return (
+            "[Amazon] The Amazon mirror's security certificate could not be verified. "
+            "This usually means a proxy, antivirus, or corporate firewall is inspecting "
+            "HTTPS traffic. Try disabling HTTPS scanning or switching network."
+        )
+    if "sslerror" in lowered or "ssl:" in lowered or "tlsv1" in lowered:
+        return (
+            "[Amazon] A secure-connection (TLS) error occurred while contacting the Amazon "
+            "mirror. This is usually a local network, VPN, or proxy problem rather than a "
+            "server outage. Try again, or switch network."
+        )
+    if "max retries exceeded" in lowered or "connection refused" in lowered \
+            or "failed to establish a new connection" in lowered \
+            or "name or service not known" in lowered or "nameresolutionerror" in lowered:
+        return (
+            "[Amazon] Could not reach the Amazon mirror. Check your internet connection — "
+            "if you are on a network that blocks unfamiliar domains, a VPN usually fixes this."
+        )
+
     if text.startswith("[Amazon] All mirrors failed. Last error: "):
         inner = text.split("Last error:", 1)[1].strip()
         humanized_inner = _humanize_amazon_error(inner)
         if humanized_inner != inner:
             return humanized_inner
     return text
+
+
+class _TlsFallbackSession:
+    """A `requests.Session` that retries once over curl_cffi's TLS stack when the
+    standard handshake fails (v1.1.8 BUG-2).
+
+    Some users cannot complete a TLS handshake to the mirrors from `requests`
+    (OpenSSL) while the very same track downloads fine elsewhere — typically a
+    middlebox that dislikes Python's TLS fingerprint, or an interception proxy.
+    curl_cffi is already bundled (it is used for the Spotify metadata proxy and
+    podcast paths) and presents a real Chrome fingerprint, so it frequently
+    succeeds where OpenSSL does not.
+
+    Deliberately scoped to NON-streaming GETs. The reported failure is the
+    `/api/track/{asin}` metadata call, and keeping streaming downloads on
+    `requests` avoids swapping response objects underneath the `with ... as r`
+    streaming path.
+    """
+
+    def __init__(self) -> None:
+        self._s = requests.Session()
+        self._curl_unavailable = False
+
+    @property
+    def headers(self):
+        return self._s.headers
+
+    def _curl_get(self, url: str, **kwargs):
+        if self._curl_unavailable:
+            return None
+        try:
+            from curl_cffi import requests as _curl
+        except Exception:
+            self._curl_unavailable = True
+            return None
+        try:
+            merged = dict(self._s.headers)
+            merged.update(kwargs.pop("headers", None) or {})
+            timeout = kwargs.pop("timeout", 30)
+            if isinstance(timeout, tuple):
+                timeout = max(timeout)
+            kwargs.pop("stream", None)
+            resp = _curl.get(
+                url,
+                headers=merged,
+                timeout=timeout,
+                impersonate="chrome124",
+                **kwargs,
+            )
+            logger.info("[Amazon] TLS fallback via curl_cffi succeeded for %s", url)
+            return resp
+        except Exception as e:
+            logger.debug("[Amazon] curl_cffi TLS fallback also failed for %s: %s", url, e)
+            return None
+
+    @staticmethod
+    def _log_proxy_diagnostics(url: str) -> None:
+        """Surface an active proxy when TLS fails (v1.1.8 BUG-2).
+
+        `requests.Session.trust_env` defaults to True, so a system/WinINET or
+        environment proxy is picked up silently. An intercepting proxy answering
+        on 443 is one of the likeliest explanations for WRONG_VERSION_NUMBER, and
+        the user has no way to know one is in play. We deliberately do NOT disable
+        proxy inheritance — plenty of users legitimately need it — we just make it
+        visible in the log so the report is actionable.
+        """
+        try:
+            from requests.utils import get_environ_proxies
+            proxies = get_environ_proxies(url, no_proxy=None)
+        except Exception:
+            return
+        if proxies:
+            logger.warning(
+                "[Amazon] A proxy is configured for this connection (%s). "
+                "If downloads keep failing with a secure-connection error, this proxy "
+                "is the most likely cause.",
+                ", ".join(f"{k}={v}" for k, v in proxies.items()),
+            )
+
+    def get(self, url, **kwargs):
+        try:
+            return self._s.get(url, **kwargs)
+        except requests.exceptions.SSLError as e:
+            if kwargs.get("stream"):
+                self._log_proxy_diagnostics(url)
+                raise
+            logger.warning(
+                "[Amazon] TLS handshake failed for %s (%s) — retrying with an "
+                "alternate TLS stack", url, str(e)[:120],
+            )
+            self._log_proxy_diagnostics(url)
+            resp = self._curl_get(url, **kwargs)
+            if resp is None:
+                raise
+            return resp
 
 
 def _first_isrc(value: str) -> Optional[str]:
@@ -381,7 +510,7 @@ class AmazonAdapter(BaseSourceAdapter):
         mirror_api_key: str = "",
         preferred_output_format: str = "source",
     ):
-        self._session = requests.Session()
+        self._session = _TlsFallbackSession()
         self._session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         })
@@ -392,12 +521,30 @@ class AmazonAdapter(BaseSourceAdapter):
         self.priority = 2  # Shared free-lossless tier with Apple/HiFi
         self._preferred_output_format = (preferred_output_format or "source").lower()
         self._prefer_lossy_download = self._preferred_output_format in {"mp3", "aac", "m4a"}
+        self._requires_atmos = self._preferred_output_format == "atmos-amazon"
         self._album_track_cache: dict[str, list[TrackMetadata]] = {}
         self._spotify_isrc_cache: dict[str, str] = {}
         self._spotify_isrc_lock = threading.Lock()
 
-        # Mirror management
-        self._mirrors = [m.rstrip("/") for m in mirrors if m]
+        # Mirror management. Schemes are normalized here (v1.1.8 BUG-2): the
+        # mirror list arrives from a remote gist manifest and nothing downstream
+        # validated it, so a scheme-less entry ("amazon.example.cfd") reached
+        # requests as a MissingSchema crash, and an "http://" entry silently
+        # downgraded the connection. A plaintext port behind an https:// URL is
+        # also one of the few things that genuinely produces WRONG_VERSION_NUMBER,
+        # so localhost/127.0.0.1 entries are deliberately left on http.
+        # Dedupe AFTER normalization: the incoming list is deduped on its raw
+        # strings, so "host", "http://host" and "https://host/" survive as three
+        # entries and only collapse once normalized. Without this the pool would
+        # treat one host as three mirrors, burning retries and skewing the
+        # per-mirror failure counts.
+        self._mirrors = []
+        _seen_mirrors: set[str] = set()
+        for _raw in mirrors:
+            _norm = self._normalize_mirror_url(_raw)
+            if _norm and _norm not in _seen_mirrors:
+                _seen_mirrors.add(_norm)
+                self._mirrors.append(_norm)
         self._current_mirror: Optional[str] = None
         self._mirror_failures: dict[str, int] = {}
 
@@ -406,6 +553,35 @@ class AmazonAdapter(BaseSourceAdapter):
         if self._direct and self._direct.is_configured():
             logger.info("[Amazon-Direct] Direct credentials loaded — will use DMLS API directly")
 
+
+    @staticmethod
+    def _normalize_mirror_url(raw: str) -> Optional[str]:
+        """Normalize one mirror entry to a usable https URL, or drop it.
+
+        Loopback hosts stay on http: the local mirror servers speak plaintext, and
+        pointing https:// at a plaintext port is itself a cause of
+        `WRONG_VERSION_NUMBER` (v1.1.8 BUG-2).
+        """
+        url = (raw or "").strip().rstrip("/")
+        if not url:
+            return None
+        host_part = url.split("://", 1)[1] if "://" in url else url
+        is_loopback = host_part.startswith(("127.0.0.1", "localhost", "[::1]", "0.0.0.0"))
+        if "://" not in url:
+            url = ("http://" if is_loopback else "https://") + url
+            logger.debug("[Amazon] Mirror entry had no scheme — assuming %s", url)
+        elif url.startswith("http://") and not is_loopback:
+            upgraded = "https://" + url[len("http://"):]
+            logger.warning(
+                "[Amazon] Mirror %s is configured as plaintext http:// — upgrading to https. "
+                "A plaintext URL against a TLS port is a known cause of connection errors.",
+                url,
+            )
+            url = upgraded
+        elif not url.startswith(("http://", "https://")):
+            logger.warning("[Amazon] Ignoring mirror entry with unsupported scheme: %s", url)
+            return None
+        return url
 
     def _get_working_mirror(self, force_rotate: bool = False) -> str:
         """
@@ -524,13 +700,51 @@ class AmazonAdapter(BaseSourceAdapter):
         )
         return re.sub(r"\s+", " ", cleaned).strip()
 
-    def _search_amazon_music_web(self, track: TrackMetadata) -> Optional[str]:
+    def _verify_scraped_asin(
+        self, track: TrackMetadata, asin: str, base: str
+    ) -> Optional[tuple[str, float, TrackMetadata]]:
+        """Fetch the Amazon track page for a scraped ASIN and verify it actually
+        matches the requested track (title/artist similarity + duration). Search
+        result pages contain ASINs for related tracks, karaoke covers and ads —
+        the first ASIN in the HTML is frequently a completely different song
+        (v1.1.8 BUG-1, 'random instrumentals')."""
+        try:
+            fetcher = AmazonMusicFetcher()
+            candidates = fetcher.fetch(f"{base}/tracks/{asin}")
+        except Exception as e:
+            logger.debug("[Amazon] Scraped-ASIN verification fetch failed for %s: %s", asin, e)
+            return None
+        if not candidates:
+            return None
+        candidate = candidates[0]
+        if not self._candidate_duration_ok(track, candidate):
+            logger.info(
+                "[Amazon] Scraped ASIN %s rejected for '%s' — duration mismatch "
+                "(candidate '%s' %.0fs vs expected %.0fs)",
+                asin, track.title, candidate.title,
+                (candidate.duration_ms or 0) / 1000, (track.duration_ms or 0) / 1000,
+            )
+            return None
+        score = score_similarity(track.title, track.artists, candidate.title, candidate.primary_artist)
+        if score < 0.60:
+            logger.info(
+                "[Amazon] Scraped ASIN %s rejected for '%s' — page is '%s' by '%s' (score=%.2f)",
+                asin, track.title, candidate.title, candidate.primary_artist, score,
+            )
+            return None
+        return asin, score, candidate
+
+    def _search_amazon_music_web(
+        self, track: TrackMetadata
+    ) -> Optional[tuple[str, float, TrackMetadata]]:
         """
         Fallback ASIN lookup against Amazon Music web pages.
 
         Odesli/Songwhip are sparse for some regional Spotify catalog entries. The
-        Amazon Music search page often still exposes track links, so scrape likely
-        ASINs and let the mirror verify availability during download.
+        Amazon Music search page often still exposes track links. Every scraped
+        ASIN is verified against its own track page before being accepted —
+        search pages are full of ASINs for unrelated/karaoke/instrumental tracks,
+        and returning the first one unverified shipped wrong audio (v1.1.8 BUG-1).
         """
         title = self._clean_search_title(getattr(track, "title", "") or "")
         if not title:
@@ -551,6 +765,9 @@ class AmazonAdapter(BaseSourceAdapter):
             "https://music.amazon.com.br",
         ]
         seen_queries: set[str] = set()
+        verified_attempts = 0
+        _MAX_VERIFY_FETCHES = 4  # cap page fetches on this last-resort path
+        checked_asins: set[str] = set()
         for artist in artist_queries:
             query = f"{title} {artist}".strip()
             key = query.lower()
@@ -573,8 +790,19 @@ class AmazonAdapter(BaseSourceAdapter):
                 candidates.extend(re.findall(r'"trackAsin"\s*:\s*"([A-Z0-9]{10})"', text))
                 candidates.extend(re.findall(r'"asin"\s*:\s*"([A-Z0-9]{10})"', text))
                 for asin in dict.fromkeys(candidates):
-                    logger.info("[Amazon] Amazon Music web search resolved '%s' to ASIN %s", track.title, asin)
-                    return asin
+                    if asin in checked_asins:
+                        continue
+                    checked_asins.add(asin)
+                    if verified_attempts >= _MAX_VERIFY_FETCHES:
+                        return None
+                    verified_attempts += 1
+                    verified = self._verify_scraped_asin(track, asin, base)
+                    if verified:
+                        logger.info(
+                            "[Amazon] Web search resolved '%s' to ASIN %s (verified, score=%.2f)",
+                            track.title, verified[0], verified[1],
+                        )
+                        return verified
         return None
 
     @staticmethod
@@ -753,7 +981,27 @@ class AmazonAdapter(BaseSourceAdapter):
             self._album_track_cache[cache_key] = best_tracks
         return best_tracks
 
-    def _resolve_via_album_page(self, track: TrackMetadata) -> Optional[str]:
+    @staticmethod
+    def _candidate_duration_ok(track: TrackMetadata, candidate: TrackMetadata) -> bool:
+        """Reject candidates whose declared duration is severely off the
+        requested track's — a positional/title match on a different recording."""
+        if not track.duration_ms or not getattr(candidate, "duration_ms", None):
+            return True
+        expected_s = track.duration_ms / 1000.0
+        actual_s = candidate.duration_ms / 1000.0
+        shorter = actual_s < expected_s * 0.8 and (expected_s - actual_s) >= 20
+        longer = actual_s > expected_s * 1.3 and (actual_s - expected_s) >= 45
+        return not (shorter or longer)
+
+    def _resolve_via_album_page(
+        self, track: TrackMetadata
+    ) -> Optional[tuple[str, float, TrackMetadata]]:
+        """Resolve a track against the matched Amazon album page's tracklist.
+
+        Returns (asin, match_score, matched_candidate) so search() can report an
+        HONEST similarity score and the candidate's real title/artist/duration —
+        never a fabricated 1.0 (v1.1.8 BUG-1).
+        """
         album_tracks = self._fetch_amazon_album_candidates(track)
         if not album_tracks:
             return None
@@ -762,24 +1010,32 @@ class AmazonAdapter(BaseSourceAdapter):
             for candidate in album_tracks:
                 if candidate.track_number != track.track_number:
                     continue
-                if score_similarity(track.title, track.artists, candidate.title, candidate.primary_artist) >= 0.60:
-                    if candidate.amazon_asin:
-                        logger.info("[Amazon] Album-page match resolved '%s' to ASIN %s", track.title, candidate.amazon_asin)
-                        return candidate.amazon_asin
+                score = score_similarity(track.title, track.artists, candidate.title, candidate.primary_artist)
+                if score >= 0.60 and candidate.amazon_asin and self._candidate_duration_ok(track, candidate):
+                    logger.info(
+                        "[Amazon] Album-page match resolved '%s' to ASIN %s (score=%.2f)",
+                        track.title, candidate.amazon_asin, score,
+                    )
+                    return candidate.amazon_asin, score, candidate
 
-        best_asin = None
+        best: Optional[tuple[str, float, TrackMetadata]] = None
         best_score = 0.0
         for candidate in album_tracks:
             if not candidate.amazon_asin:
                 continue
+            if not self._candidate_duration_ok(track, candidate):
+                continue
             score = score_similarity(track.title, track.artists, candidate.title, candidate.primary_artist)
             if score > best_score:
                 best_score = score
-                best_asin = candidate.amazon_asin
+                best = (candidate.amazon_asin, score, candidate)
 
-        if best_asin and best_score >= 0.72:
-            logger.info("[Amazon] Fuzzy album-page match resolved '%s' to ASIN %s (score=%.2f)", track.title, best_asin, best_score)
-            return best_asin
+        if best and best_score >= 0.72:
+            logger.info(
+                "[Amazon] Fuzzy album-page match resolved '%s' to ASIN %s (score=%.2f)",
+                track.title, best[0], best_score,
+            )
+            return best
         return None
 
     def _lookup_spotify_isrc_via_soundplate(self, spotify_id: str) -> Optional[str]:
@@ -850,23 +1106,65 @@ class AmazonAdapter(BaseSourceAdapter):
         """
         Resolve track to Amazon Music ASIN.
         Uses the ASIN already on the track (when sourced from an Amazon Music URL)
-        or falls back to Odesli cross-platform lookup.
+        or falls back to mirror / Odesli / album-page / web-search resolution.
+
+        The similarity score reflects HOW the ASIN was resolved (v1.1.8 BUG-1) —
+        previously every path claimed similarity_score=1.0 and isrc_match=True,
+        which made a first-ASIN-in-HTML web scrape indistinguishable from an
+        exact platform ID and let wrong songs through every resolver gate.
         """
         amazon_id = getattr(track, "amazon_asin", None)
         resolved_payload: Optional[dict] = None
+        # Provenance of the resolution — controls the honesty of the result.
+        similarity: float = 1.0
+        isrc_verified: bool = bool(track.isrc)
+        matched_title: str = track.title
+        matched_artists: list[str] = list(track.artists or [])
+        matched_duration_ms: Optional[int] = track.duration_ms
+        matched_album: Optional[str] = None
+
         if amazon_id:
+            # Exact platform ID from an Amazon Music URL — genuinely authoritative.
             logger.debug(f"[Amazon] Using embedded ASIN for '{track.title}': {amazon_id}")
         else:
             amazon_id, resolved_payload = self._resolve_via_mirror(track)
+            if amazon_id:
+                # Mirror resolves inside Amazon's own marketplace index — strong,
+                # but it is a cross-platform mapping, not an ISRC verification.
+                similarity = 0.95
+                isrc_verified = False
             if not amazon_id:
                 self._ensure_spotify_isrc(track)
                 logger.debug(f"[Amazon] Resolving ID via Odesli: {track.title}")
                 platform_ids = self._odesli.resolve(track)
                 amazon_id = platform_ids.get("amazonMusic") or platform_ids.get("amazon")
+                if amazon_id:
+                    # Cross-platform link index — usually right, occasionally maps
+                    # to a different release. Strong but not perfect confidence.
+                    similarity = 0.90
+                    isrc_verified = False
             if not amazon_id:
-                amazon_id = self._resolve_via_album_page(track)
+                album_match = self._resolve_via_album_page(track)
+                if album_match:
+                    amazon_id, similarity, candidate = album_match
+                    isrc_verified = False
+                    matched_title = candidate.title or matched_title
+                    if candidate.artists:
+                        matched_artists = list(candidate.artists)
+                    if getattr(candidate, "duration_ms", None):
+                        matched_duration_ms = candidate.duration_ms
+                    matched_album = candidate.album or None
             if not amazon_id:
-                amazon_id = self._search_amazon_music_web(track)
+                web_match = self._search_amazon_music_web(track)
+                if web_match:
+                    amazon_id, similarity, candidate = web_match
+                    isrc_verified = False
+                    matched_title = candidate.title or matched_title
+                    if candidate.artists:
+                        matched_artists = list(candidate.artists)
+                    if getattr(candidate, "duration_ms", None):
+                        matched_duration_ms = candidate.duration_ms
+                    matched_album = candidate.album or None
 
         if not amazon_id:
             logger.debug(f"[Amazon] No Amazon ID found for '{track.title}'")
@@ -874,22 +1172,22 @@ class AmazonAdapter(BaseSourceAdapter):
 
         # Use track title as album fallback for singles where the page scraper
         # couldn't extract an album name (Amazon single pages often omit it).
-        album = track.album or track.title or ""
+        album = matched_album or track.album or track.title or ""
 
         if self._prefer_lossy_download:
             return SearchResult(
                 source="amazon",
-                title=track.title,
-                artists=track.artists,
+                title=matched_title,
+                artists=matched_artists,
                 album=album,
-                duration_ms=track.duration_ms,
+                duration_ms=matched_duration_ms,
                 audio_format=AudioFormat.OPUS,
                 quality_kbps=None,
                 is_lossless=False,
                 download_url=None,
                 stream_id=amazon_id,
-                similarity_score=1.0,
-                isrc_match=True if track.isrc else False,
+                similarity_score=similarity,
+                isrc_match=isrc_verified,
                 is_explicit=track.is_explicit,
                 source_metadata={"amazon_resolved_stream": resolved_payload} if resolved_payload else {},
             )
@@ -903,18 +1201,18 @@ class AmazonAdapter(BaseSourceAdapter):
         # can improve on an otherwise 16-bit download.
         return SearchResult(
             source="amazon",
-            title=track.title,
-            artists=track.artists,
+            title=matched_title,
+            artists=matched_artists,
             album=album,
-            duration_ms=track.duration_ms,
+            duration_ms=matched_duration_ms,
             audio_format=AudioFormat.FLAC,
             quality_kbps=None,
             is_lossless=True,
             bit_depth=None,
             download_url=None,
             stream_id=amazon_id,
-            similarity_score=1.0,
-            isrc_match=True if track.isrc else False,
+            similarity_score=similarity,
+            isrc_match=isrc_verified,
             is_explicit=track.is_explicit,
             source_metadata={"amazon_resolved_stream": resolved_payload} if resolved_payload else {},
         )
@@ -972,7 +1270,14 @@ class AmazonAdapter(BaseSourceAdapter):
 
             try:
                 logger.debug(f"[Amazon] Fetching stream info (attempt {attempt+1}/{max_attempts}) from {mirror}...")
-                params = {"prefer_lossy": "true"} if self._prefer_lossy_download else None
+                # Atmos (v1.1.8 FEAT-1) takes precedence: the Amazon mirror selects
+                # the EC-3 AdaptationSet from the SIREN_KATANA manifest.
+                if self._requires_atmos:
+                    params = {"format": "atmos"}
+                elif self._prefer_lossy_download:
+                    params = {"prefer_lossy": "true"}
+                else:
+                    params = None
                 resp = self._session.get(api_url, params=params, timeout=20)
 
                 if resp.status_code == 200:
@@ -992,7 +1297,10 @@ class AmazonAdapter(BaseSourceAdapter):
                         if data.get("sampleRate"):
                             result.source_metadata["sample_rate_hz"] = int(data["sampleRate"])
 
-                    return self._process_download(download_url, decryption_key, output_path)
+                    return self._process_download(
+                        download_url, decryption_key, output_path,
+                        server_codec=(data.get("codec") or "").lower(),
+                    )
 
                 if resp.status_code == 429:
                     saw_rate_limit = True
@@ -1066,7 +1374,23 @@ class AmazonAdapter(BaseSourceAdapter):
             return False
         return True
 
-    def _process_download(self, download_url: str, decryption_key: Optional[str], output_path: str) -> str:
+    # Dolby spatial/surround codecs. ffmpeg picks its strict `ipod` muxer for the
+    # `.m4a` extension, and that muxer's allowlist does NOT include EC-3 or AC-4 —
+    # it fails with "Could not find tag for codec eac3 in stream #0". These must
+    # be written to `.mp4` so ffmpeg selects its general MP4 muxer. Documented in
+    # API-Mirrors/OPERATIONS.md section 6; it was fixed in the web adapter and the
+    # Telegram bot but never here, which is why desktop Atmos never produced a
+    # single file. Verified: the same stream fails to `.m4a` and decrypts cleanly
+    # to `.mp4` as eac3 / 6 channels / 48 kHz.
+    _SPATIAL_CODECS = {"eac3", "ec-3", "ec3", "ac4", "ac-4", "ac3"}
+
+    def _process_download(
+        self,
+        download_url: str,
+        decryption_key: Optional[str],
+        output_path: str,
+        server_codec: str = "",
+    ) -> str:
         # Download encrypted file
         temp_enc_path = output_path + ".enc.m4a"
         logger.debug(f"[Amazon] Downloading encrypted stream: {temp_enc_path}")
@@ -1086,7 +1410,20 @@ class AmazonAdapter(BaseSourceAdapter):
                 )
             else:
                 logger.debug("[Amazon] Probing failed — treating stream as generic M4A/MP4")
-            dec_ext = ".flac" if codec == "flac" else ".m4a"
+            # The server tells us the real codec up front; the local probe reads the
+            # still-ENCRYPTED file, where the sample entry is wrapped as `enca`/`encv`
+            # and the true format can be unreadable. Trust the server first.
+            is_spatial = (
+                server_codec in self._SPATIAL_CODECS
+                or (codec or "") in self._SPATIAL_CODECS
+                or self._requires_atmos
+            )
+            if codec == "flac":
+                dec_ext = ".flac"
+            elif is_spatial:
+                dec_ext = ".mp4"
+            else:
+                dec_ext = ".m4a"
 
             # Decrypt
             final_path = output_path + dec_ext
@@ -1122,7 +1459,12 @@ class AmazonAdapter(BaseSourceAdapter):
 
         # Post-process: Standardize extension and remux if needed
         final_audio_path = self._finalize_audio(final_path)
-        if not self._prefer_lossy_download and not self._is_lossless_output(final_audio_path):
+        # Dolby Atmos is a spatial format, not a "lossless" one, so the lossless
+        # gate below would discard a perfectly good EC-3 file that the user
+        # explicitly asked for. Skip it when Atmos was requested.
+        if (not self._requires_atmos
+                and not self._prefer_lossy_download
+                and not self._is_lossless_output(final_audio_path)):
             try:
                 if os.path.exists(final_audio_path):
                     os.remove(final_audio_path)

@@ -23,69 +23,102 @@ import (
 )
 
 type Config struct {
-	DownloadPath                string   `json:"download_path"`
-	AppleEnabled                bool     `json:"apple_enabled"`
-	AppleAuthorizationToken     string   `json:"apple_authorization_token,omitempty"`
-	AppleMusicUserToken         string   `json:"apple_music_user_token,omitempty"`
-	AppleStorefront             string   `json:"apple_storefront,omitempty"`
-	AppleWVDPath                string   `json:"apple_wvd_path,omitempty"`
-	AmazonEnabled               bool     `json:"amazon_enabled"`
-	AmazonDirectCredsJSON       string   `json:"amazon_direct_creds_json,omitempty"`
-	AmazonWVDPath               string   `json:"amazon_wvd_path,omitempty"`
-	AmazonRegion                string   `json:"amazon_region,omitempty"`
-	QobuzEnabled                bool     `json:"qobuz_enabled"`
-	QobuzEmail                  string   `json:"qobuz_email,omitempty"`
-	QobuzPassword               string   `json:"qobuz_password,omitempty"`
-	QobuzAppID                  string   `json:"qobuz_app_id,omitempty"`
-	QobuzAppSecret              string   `json:"qobuz_app_secret,omitempty"`
-	QobuzUserAuthToken          string   `json:"qobuz_user_auth_token,omitempty"`
-	DeezerARLToken              string   `json:"deezer_arl_token,omitempty"`
-	DeezerBFSecret              string   `json:"deezer_bf_secret,omitempty"`
-	SoulseekEnabled             bool     `json:"soulseek_enabled"`
-	SoulseekUsername            string   `json:"soulseek_username,omitempty"`
-	SoulseekPassword            string   `json:"soulseek_password,omitempty"`
-	SoulseekSeedAfterDL         bool     `json:"soulseek_seed_after_download"`
-	SourcesEnabled              []string `json:"sources_enabled,omitempty"`
-	FirstRunComplete            bool     `json:"first_run_complete"`
-	OutputFormat                string   `json:"output_format,omitempty"`
-	MaxRetries                  int      `json:"max_retries,omitempty"`
-	LibraryMode                 string   `json:"library_mode,omitempty"`
-	PreferExplicit              *bool    `json:"prefer_explicit,omitempty"`
-	StrictMatching              bool     `json:"strict_matching"`
-	FolderStructure             string   `json:"folder_structure,omitempty"`
-	AlbumFolderStructure        string   `json:"album_folder_structure,omitempty"`
-	PlaylistFolderStructure     string   `json:"playlist_folder_structure,omitempty"`
-	SingleTrackStructure        string   `json:"single_track_structure,omitempty"`
-	FilenameFormat              string   `json:"filename_format,omitempty"`
-	SingleTrackFilenameTemplate string   `json:"single_track_filename_template,omitempty"`
-	AlbumZipNameTemplate        string   `json:"album_zip_name_template,omitempty"`
-	AlbumTrackFilenameTemplate  string   `json:"album_track_filename_template,omitempty"`
-	FolderStructureTemplate     string   `json:"folder_structure_template,omitempty"`
-	MultiDiscHandling           string   `json:"multi_disc_handling,omitempty"`
-	TrackNumberPadding          int      `json:"track_number_padding,omitempty"`
-	IllegalCharacterReplacement string   `json:"illegal_character_replacement,omitempty"`
-	WhitespaceHandling          string   `json:"whitespace_handling,omitempty"`
-	FilenameConflictBehavior    string   `json:"filename_conflict_behavior,omitempty"`
-	FetchLyrics                 bool     `json:"fetch_lyrics"`
-	SpotifySpDc                 string   `json:"spotify_sp_dc,omitempty"`
-	TidalEnabled                bool     `json:"tidal_enabled"`
-	TidalAuthMode               string   `json:"tidal_auth_mode,omitempty"`
-	TidalSessionJSON            string   `json:"tidal_session_json,omitempty"`
-	TidalAccessToken            string   `json:"tidal_access_token,omitempty"`
-	TidalRefreshToken           string   `json:"tidal_refresh_token,omitempty"`
-	TidalSessionID              string   `json:"tidal_session_id,omitempty"`
-	TidalTokenType              string   `json:"tidal_token_type,omitempty"`
-	TidalCountryCode            string   `json:"tidal_country_code,omitempty"`
-	AntraApiKey                 string        `json:"antra_api_key,omitempty"`
-	Theme                       string        `json:"theme,omitempty"`
-	DownloadSource              string        `json:"download_source,omitempty"`
-	DownloadSources             []string      `json:"download_sources,omitempty"`
-	SaveCoverArtSidecar         bool          `json:"save_cover_art_sidecar"`
-	AutoSyncEnabled             bool          `json:"auto_sync_enabled"`
-	AutoSyncHour                int           `json:"auto_sync_hour"`
-	AutoSyncMinute              int           `json:"auto_sync_minute"`
-	AutoSyncDays                int           `json:"auto_sync_days"` // bitmask Mon=0…Sun=6
-	TrackedPlaylists            []interface{} `json:"tracked_playlists,omitempty"`
+	DownloadPath            string   `json:"download_path"`
+	AppleEnabled            bool     `json:"apple_enabled"`
+	AppleAuthorizationToken string   `json:"apple_authorization_token,omitempty"`
+	AppleMusicUserToken     string   `json:"apple_music_user_token,omitempty"`
+	AppleStorefront         string   `json:"apple_storefront,omitempty"`
+	AppleWVDPath            string   `json:"apple_wvd_path,omitempty"`
+	AmazonEnabled           bool     `json:"amazon_enabled"`
+	AmazonDirectCredsJSON   string   `json:"amazon_direct_creds_json,omitempty"`
+	AmazonWVDPath           string   `json:"amazon_wvd_path,omitempty"`
+	AmazonRegion            string   `json:"amazon_region,omitempty"`
+	QobuzEnabled            bool     `json:"qobuz_enabled"`
+	QobuzEmail              string   `json:"qobuz_email,omitempty"`
+	QobuzPassword           string   `json:"qobuz_password,omitempty"`
+	QobuzAppID              string   `json:"qobuz_app_id,omitempty"`
+	QobuzAppSecret          string   `json:"qobuz_app_secret,omitempty"`
+	QobuzUserAuthToken      string   `json:"qobuz_user_auth_token,omitempty"`
+	DeezerARLToken          string   `json:"deezer_arl_token,omitempty"`
+	DeezerBFSecret          string   `json:"deezer_bf_secret,omitempty"`
+	SoulseekEnabled         bool     `json:"soulseek_enabled"`
+	SoulseekUsername        string   `json:"soulseek_username,omitempty"`
+	SoulseekPassword        string   `json:"soulseek_password,omitempty"`
+	SoulseekSeedAfterDL     bool     `json:"soulseek_seed_after_download"`
+	SourcesEnabled          []string `json:"sources_enabled,omitempty"`
+	FirstRunComplete        bool     `json:"first_run_complete"`
+	OutputFormat            string   `json:"output_format,omitempty"`
+	MaxRetries              int      `json:"max_retries,omitempty"`
+	LibraryMode             string   `json:"library_mode,omitempty"`
+	PreferExplicit          *bool    `json:"prefer_explicit,omitempty"`
+	StrictMatching          bool     `json:"strict_matching"`
+	// v1.1.8 FEAT-3/2/4. Pointers, not plain bools: these default to TRUE, and a
+	// plain bool would read as false whenever the key is absent from an existing
+	// config.json — silently disabling them on upgrade. Same reason PreferExplicit
+	// above is a pointer.
+	StrictFormat                *bool  `json:"strict_format,omitempty"`
+	PreventLossyTranscode       *bool  `json:"prevent_lossy_transcode,omitempty"`
+	WriteAntraTags              *bool  `json:"write_antra_tags,omitempty"`
+	FolderStructure             string `json:"folder_structure,omitempty"`
+	AlbumFolderStructure        string `json:"album_folder_structure,omitempty"`
+	PlaylistFolderStructure     string `json:"playlist_folder_structure,omitempty"`
+	SingleTrackStructure        string `json:"single_track_structure,omitempty"`
+	FilenameFormat              string `json:"filename_format,omitempty"`
+	SingleTrackFilenameTemplate string `json:"single_track_filename_template,omitempty"`
+	AlbumZipNameTemplate        string `json:"album_zip_name_template,omitempty"`
+	AlbumTrackFilenameTemplate  string `json:"album_track_filename_template,omitempty"`
+	// v1.1.8 FEAT-11 — pointer, not string: with a plain string, `omitempty` drops
+	// "" from config.json, so a deliberately-cleared template is indistinguishable
+	// from one that was never set and the default gets re-applied on next launch.
+	// nil = never configured, "" = cleared on purpose (flat library root).
+	// Same class of trap as the *bool fields above.
+	FolderStructureTemplate     *string `json:"folder_structure_template,omitempty"`
+	MultiDiscHandling           string  `json:"multi_disc_handling,omitempty"`
+	TrackNumberPadding          int     `json:"track_number_padding,omitempty"`
+	IllegalCharacterReplacement string  `json:"illegal_character_replacement,omitempty"`
+	WhitespaceHandling          string  `json:"whitespace_handling,omitempty"`
+	FilenameConflictBehavior    string  `json:"filename_conflict_behavior,omitempty"`
+	FetchLyrics                 bool    `json:"fetch_lyrics"`
+	SpotifySpDc                 string  `json:"spotify_sp_dc,omitempty"`
+	TidalEnabled                bool    `json:"tidal_enabled"`
+	TidalAuthMode               string  `json:"tidal_auth_mode,omitempty"`
+	TidalSessionJSON            string  `json:"tidal_session_json,omitempty"`
+	TidalAccessToken            string  `json:"tidal_access_token,omitempty"`
+	TidalRefreshToken           string  `json:"tidal_refresh_token,omitempty"`
+	TidalSessionID              string  `json:"tidal_session_id,omitempty"`
+	TidalTokenType              string  `json:"tidal_token_type,omitempty"`
+	TidalCountryCode            string  `json:"tidal_country_code,omitempty"`
+	// AntraApiKey is the PASTED supporter/premium key (ak_ / pk_) — a credential
+	// the user owns and types in. AntraDeviceToken is the device-code login token
+	// (at_), minted per device by the website.
+	//
+	// These are deliberately SEPARATE fields. Until v1.1.8 the device token was
+	// written into AntraApiKey, which is also what the Settings paste box binds
+	// to — so signing in overwrote the user's supporter key with a token that
+	// /api/keys/validate cannot recognise (it is not a keys.json entry). The UI
+	// then reported "Key not recognized", isSupporter went false, and the user
+	// was silently demoted to 1 worker with no FEAT-7 discount. Logging in must
+	// never cost someone their supporter tier, so the two never share a field.
+	AntraApiKey      string `json:"antra_api_key,omitempty"`
+	AntraDeviceToken string `json:"antra_device_token,omitempty"`
+	Theme            string `json:"theme,omitempty"`
+	Font             string `json:"font,omitempty"`
+	// Notification sounds (v1.1.8 FEAT-13). Volume is a *int and BatchOnly a
+	// *bool on purpose: a plain int reads 0 (= silent) and a plain bool reads
+	// false when the key is absent from an existing config.json, which would
+	// silently disable the feature for every current user. Same trap as
+	// PreferExplicit / the FEAT-3/2/4 settings.
+	NotifySound         string        `json:"notify_sound,omitempty"`
+	NotifyVolume        *int          `json:"notify_volume,omitempty"`
+	NotifyBatchOnly     *bool         `json:"notify_batch_only,omitempty"`
+	DownloadSource      string        `json:"download_source,omitempty"`
+	DownloadSources     []string      `json:"download_sources,omitempty"`
+	SaveCoverArtSidecar bool          `json:"save_cover_art_sidecar"`
+	AutoSyncEnabled     bool          `json:"auto_sync_enabled"`
+	AutoSyncHour        int           `json:"auto_sync_hour"`
+	AutoSyncMinute      int           `json:"auto_sync_minute"`
+	AutoSyncDays        int           `json:"auto_sync_days"` // bitmask Mon=0…Sun=6
+	TrackedPlaylists    []interface{} `json:"tracked_playlists,omitempty"`
 }
 
 type HistoryItem struct {
@@ -164,6 +197,14 @@ func (a *App) GetConfig() Config {
 	json.Unmarshal(data, &cfg)
 	if !bytes.Contains(data, []byte(`"fetch_lyrics"`)) {
 		cfg.FetchLyrics = true
+	}
+	// Migrate installs that already signed in while the device token shared a
+	// field with the supporter key. Read-only and idempotent — persisted by the
+	// next SaveConfig. The supporter key it displaced cannot be recovered; the
+	// user has to re-paste it (it is in their email).
+	if cfg.AntraDeviceToken == "" && strings.HasPrefix(strings.TrimSpace(cfg.AntraApiKey), "at_") {
+		cfg.AntraDeviceToken = strings.TrimSpace(cfg.AntraApiKey)
+		cfg.AntraApiKey = ""
 	}
 	if cfg.DownloadPath == "" {
 		userProfile := os.Getenv("USERPROFILE")
@@ -1114,18 +1155,25 @@ func (a *App) SearchArtists(query string, source string) string {
 	return string(result)
 }
 
-func (a *App) GetDiscoveryData(region string, genreId string, genreName string) string {
+func (a *App) GetDiscoveryData(region string, genreId string, genreName string, source string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	if region == "" {
 		region = "us"
 	}
+	// Normalise before it reaches the CLI: --discovery-source is a choices=
+	// argument, so an empty or unexpected value fails the whole call rather
+	// than degrading. Spotify's Discover is the personalised home feed, and the
+	// backend falls back to Apple by itself when no account is connected.
+	if source != "spotify" {
+		source = "apple"
+	}
 
 	backend, err := ensureBundledBackend()
 	var out []byte
 	if err == nil {
-		args := []string{"--discovery-json", "--discovery-region", region}
+		args := []string{"--discovery-json", "--discovery-region", region, "--discovery-source", source}
 		if genreId != "" {
 			args = append(args, "--discovery-genre-id", genreId)
 		}
@@ -1141,7 +1189,7 @@ func (a *App) GetDiscoveryData(region string, genreId string, genreName string) 
 		if resolveErr != nil {
 			return `{"error":"could not resolve backend"}`
 		}
-		args := []string{"-m", "antra.json_cli", "--discovery-json", "--discovery-region", region}
+		args := []string{"-m", "antra.json_cli", "--discovery-json", "--discovery-region", region, "--discovery-source", source}
 		if genreId != "" {
 			args = append(args, "--discovery-genre-id", genreId)
 		}
@@ -1174,18 +1222,21 @@ func (a *App) GetDiscoveryData(region string, genreId string, genreName string) 
 	return string(bytes.TrimSpace(out))
 }
 
-func (a *App) GetDiscoveryGenres(region string) string {
+func (a *App) GetDiscoveryGenres(region string, source string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if region == "" {
 		region = "us"
 	}
+	if source != "spotify" {
+		source = "apple"
+	}
 
 	backend, err := ensureBundledBackend()
 	var out []byte
 	if err == nil {
-		cmd := exec.CommandContext(ctx, backend, "--discovery-genres-only", "--discovery-region", region, "--config", getConfigPath())
+		cmd := exec.CommandContext(ctx, backend, "--discovery-genres-only", "--discovery-region", region, "--discovery-source", source, "--config", getConfigPath())
 		hideProcess(cmd)
 		out, err = cmd.Output()
 	} else {
@@ -1193,7 +1244,7 @@ func (a *App) GetDiscoveryGenres(region string) string {
 		if resolveErr != nil {
 			return `{"error":"could not resolve backend"}`
 		}
-		cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--discovery-genres-only", "--discovery-region", region, "--config", getConfigPath())
+		cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--discovery-genres-only", "--discovery-region", region, "--discovery-source", source, "--config", getConfigPath())
 		cmd.Dir = workDir
 		cmd.Env = env
 		hideProcess(cmd)
@@ -1315,22 +1366,155 @@ func (a *App) SetSpotifyToken(token string) string {
 	return `{"success": true, "message": "` + strings.TrimSpace(output) + `"}`
 }
 
-// isSupporterKey returns true when the configured API key is a supporter (admin)
-// key.  The check is lightweight: it calls GET /api/keys/validate on the Tidal
-// mirror.  A failure (offline server, no key) returns false so downloads still
-// work — they just use the single-worker default.
-func (a *App) isSupporterKey() bool {
-	info := a.GetKeyInfo()
-	return info.Valid && info.IsSupporter
+// supporterContext resolves, in a single /api/keys/validate round-trip, the two
+// things a download run needs from the user's key: whether they get supporter
+// concurrency, and whether their own key may be used to authenticate to the
+// mirrors.
+//
+// The second return value is the load-bearing one and it is deliberately empty
+// unless the server confirmed a supporter key.  Mirror adapters otherwise use
+// the shared manifest key (see service.py `mirror_api_key`), and v1.1.7 proved
+// that sending an unregistered personal key there 401s and silently kills
+// whole-album resolution.  So an unverified guess is never sent — only a key the
+// server has just vouched for.
+//
+// Why it matters: FEAT-7's politeness-delay discount is chosen from the key on
+// the incoming request.  Because every desktop download authenticated with the
+// shared manifest key (key_type "regular"), no desktop supporter has ever
+// received the discount — the FEAT-7 measurements were taken server-side against
+// production keys directly, never through the adapter path.
+// There are now two possible personal credentials — a device-login token and a
+// pasted supporter key — and the choice between them is deliberately made on
+// TIER, not on precedence. Preferring the token unconditionally would price a
+// supporter who signed in with a free website account as free, which is exactly
+// the demotion this whole area got wrong before; preferring the key
+// unconditionally would throw away FEAT-8's per-user attribution. So: whichever
+// credential the server confirms as supporter wins, and the token is used at
+// free tier when neither is.
+func (a *App) supporterContext() (isSupporter bool, mirrorKey string) {
+	cfg := a.GetConfig()
+	deviceToken := storedDeviceToken(cfg)
+	personal := strings.TrimSpace(cfg.AntraApiKey)
+	if strings.HasPrefix(personal, "at_") {
+		personal = "" // a token in the legacy shared field is not a supporter key
+	}
+
+	var status DeviceAccountStatus
+	if deviceToken != "" {
+		status = a.GetDeviceAccountStatus()
+	}
+	var keyInfo KeyInfoResult
+	if personal != "" {
+		// "Server unreachable" leaves Valid false even though the key may well be
+		// fine — the conservative rule is deliberate, because v1.1.7 showed an
+		// unvouched key 401ing at the mirrors kills whole-album resolution.
+		keyInfo = a.validateKeyAgainstServer(personal)
+	}
+
+	decided, key, needManifestCheck := chooseCredential(deviceToken, status, personal, keyInfo)
+	if needManifestCheck {
+		// No personal credential at all. Validate the manifest key purely for the
+		// supporter check, exactly as the previous isSupporterKey() did. It is
+		// never returned as a mirror key: the adapters already default to it, so
+		// passing it would be a no-op.
+		info := a.GetKeyInfo()
+		return info.Valid && info.IsSupporter, ""
+	}
+	return decided, key
+}
+
+// chooseCredential is the whole decision, kept pure so the table can be tested
+// without a server: which credential authenticates mirror requests, and whether
+// this user counts as a supporter.
+//
+// The third return says "neither credential exists, fall back to checking the
+// shared manifest key" — kept out of here because it needs a network call.
+func chooseCredential(
+	deviceToken string, status DeviceAccountStatus,
+	personal string, keyInfo KeyInfoResult,
+) (isSupporter bool, mirrorKey string, needManifestCheck bool) {
+	// A token the server has positively refused (revoked, or past the renewal
+	// chain cap) must not authenticate anything. An UNREACHABLE server is not a
+	// refusal — signing someone out over an outage is the exact failure FEAT-12
+	// exists to prevent — so the token is kept and simply carries no tier.
+	if deviceToken != "" && status.Reachable && !status.Valid {
+		deviceToken = ""
+	}
+	deviceSupporter := deviceToken != "" && status.IsSupporter
+	keySupporter := personal != "" && keyInfo.Valid && keyInfo.IsSupporter
+
+	switch {
+	case deviceSupporter:
+		return true, deviceToken, false
+	case keySupporter:
+		// The key wins here rather than the token: preferring the token
+		// unconditionally would price a supporter who signed in with a free
+		// website account as free, which is the demotion this area got wrong.
+		return true, personal, false
+	case deviceToken != "":
+		// Signed in at free tier: still authenticate as this user, which is the
+		// point of FEAT-8 — per-account attribution instead of one shared key.
+		return false, deviceToken, false
+	case personal == "":
+		return false, "", true
+	default:
+		return false, "", false
+	}
+}
+
+// endpointEnv hands the resolved mirror URLs to the Python backend as env vars.
+//
+// Go is the single fetcher: it is the side that holds the device token, so it is
+// the only side that can ask the account for endpoints. Python's config reads
+// these env vars ahead of any manifest, so with them set the backend never needs
+// to fetch anything — and ANTRA_ENDPOINT_MANIFEST_DISABLED stops it falling back
+// to the public gist behind our back.
+//
+// Empty values are omitted rather than exported blank, so a partial manifest
+// degrades to the existing behaviour for the missing entries instead of
+// blanking a URL Python would otherwise have resolved.
+func endpointEnv() []string {
+	return endpointEnvFrom(loadEndpointManifest())
+}
+
+func endpointEnvFrom(m endpointManifest) []string {
+	var env []string
+	add := func(name, value string) {
+		if v := strings.TrimRight(strings.TrimSpace(value), "/"); v != "" {
+			env = append(env, name+"="+v)
+		}
+	}
+	add("TIDAL_MIRROR_URL", m.Mirrors.Tidal)
+	add("QOBUZ_MIRROR_URL", m.Mirrors.Qobuz)
+	add("DEEZER_MIRROR_URL", m.Mirrors.Deezer)
+	add("APPLE_MIRRORS", m.Mirrors.Apple)
+	add("AMAZON_MIRRORS", m.Mirrors.Amazon)
+	// Only claim the backend needs no manifest when we actually gave it the
+	// endpoints; otherwise let it resolve them the old way.
+	if len(env) > 0 {
+		env = append(env, "ANTRA_ENDPOINT_MANIFEST_DISABLED=1")
+	}
+	return env
 }
 
 func (a *App) resolveBackendCommand(playlists []string) (string, []string, string, []string, error) {
 	// Determine concurrent-worker count: 2 for supporter keys, 1 for everyone else.
+	// v1.1.8 FEAT-7 — concurrency is the SAFE supporter speed lever. The mirrors'
+	// politeness delay is per streaming account, so N workers use N *different*
+	// accounts in parallel and each keeps its own spacing: throughput scales
+	// without raising the per-account request rate that risks bans. Raised 2 -> 4.
+	// Deliberately not higher: the Tidal pool has a documented thundering-herd
+	// history (v1.1.7), and 4 stays well inside it.
+	isSupporter, mirrorKey := a.supporterContext()
 	maxWorkers := "1"
-	if a.isSupporterKey() {
-		maxWorkers = "2"
+	if isSupporter {
+		maxWorkers = "4"
 	}
 	extraEnv := []string{"PYTHONUTF8=1", "ANTRA_MAX_WORKERS=" + maxWorkers}
+	if mirrorKey != "" {
+		extraEnv = append(extraEnv, "ANTRA_MIRROR_API_KEY="+mirrorKey)
+	}
+	extraEnv = append(extraEnv, endpointEnv()...)
 
 	if bundledBackend, err := ensureBundledBackend(); err == nil {
 		args := append([]string{}, playlists...)
@@ -1377,7 +1561,11 @@ func (a *App) resolveBackendCommand(playlists []string) (string, []string, strin
 	args := []string{jsonCliScript}
 	args = append(args, playlists...)
 	args = append(args, "--config", getConfigPath())
-	env := append(os.Environ(), fmt.Sprintf("PYTHONPATH=%s", parentDir), "PYTHONUTF8=1", "ANTRA_MAX_WORKERS="+maxWorkers)
+	// Reuse extraEnv rather than re-listing the variables: the two paths had
+	// already drifted once, and a variable added above must not silently be
+	// missing when running from source.
+	env := append(os.Environ(), fmt.Sprintf("PYTHONPATH=%s", parentDir))
+	env = append(env, extraEnv...)
 	return pythonExe, args, parentDir, env, nil
 }
 
@@ -1454,7 +1642,97 @@ func getEndpointManifestCachePaths() []string {
 	return uniqueCleanPaths(paths)
 }
 
+// fetchEndpointsFromAccount asks the website for the mirror endpoints, using the
+// signed-in device token (v1.1.8 FEAT-8 Phase A).
+//
+// This is what lets the public gist stop carrying a working credential. It does
+// NOT make the hostnames secret — they are in public DNS and in the TLS SNI of
+// every request, so anyone can find them. What it changes is that finding them
+// is no longer the same as being able to USE them.
+//
+// Returns ok=false for any problem, including not being signed in, so every
+// caller falls back to the gist exactly as before.
+func fetchEndpointsFromAccount() (endpointManifest, bool) {
+	token := storedDeviceToken((&App{}).GetConfig())
+	if token == "" {
+		return endpointManifest{}, false
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, deviceAuthURL("/api/desktop/endpoints"), nil)
+	if err != nil {
+		return endpointManifest{}, false
+	}
+	req.Header.Set("X-API-Key", token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return endpointManifest{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return endpointManifest{}, false
+	}
+
+	var body struct {
+		Mirrors endpointManifestMirrors `json:"mirrors"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&body) != nil {
+		return endpointManifest{}, false
+	}
+	m := endpointManifest{Mirrors: body.Mirrors}
+	m.normalize()
+	// Deliberately no ApiKey: the device token IS the credential now, and it is
+	// already sent as ANTRA_MIRROR_API_KEY.
+	if m.Mirrors.Tidal == "" && m.Mirrors.Qobuz == "" && m.Mirrors.Apple == "" &&
+		m.Mirrors.Amazon == "" && m.Mirrors.Deezer == "" {
+		return endpointManifest{}, false
+	}
+	return m, true
+}
+
+// loadEndpointManifest is called on many paths (health checks, key validation,
+// every download start), and each call used to make a network fetch. With the
+// account lookup added in front of it that would be two, so the result is cached
+// for the process. invalidateEndpointManifest() is called whenever sign-in state
+// changes, which is the only thing that can change the answer.
+var (
+	manifestCacheMu  sync.Mutex
+	manifestCacheVal endpointManifest
+	manifestCacheAt  time.Time
+	manifestCacheOK  bool
+	manifestCacheTTL = 5 * time.Minute
+)
+
+func invalidateEndpointManifest() {
+	manifestCacheMu.Lock()
+	manifestCacheOK = false
+	manifestCacheMu.Unlock()
+}
+
 func loadEndpointManifest() endpointManifest {
+	manifestCacheMu.Lock()
+	if manifestCacheOK && time.Since(manifestCacheAt) < manifestCacheTTL {
+		cached := manifestCacheVal
+		manifestCacheMu.Unlock()
+		return cached
+	}
+	manifestCacheMu.Unlock()
+
+	result := resolveEndpointManifest()
+
+	manifestCacheMu.Lock()
+	manifestCacheVal, manifestCacheAt, manifestCacheOK = result, time.Now(), true
+	manifestCacheMu.Unlock()
+	return result
+}
+
+func resolveEndpointManifest() endpointManifest {
+	// Signed-in clients get their endpoints from the account, not the gist.
+	if manifest, ok := fetchEndpointsFromAccount(); ok {
+		writeEndpointManifestCache(manifest)
+		return manifest
+	}
+
 	manifestURL := strings.TrimSpace(os.Getenv("ANTRA_ENDPOINT_MANIFEST_URL"))
 	if manifestURL == "" {
 		manifestURL = defaultEndpointManifestURL
@@ -1809,6 +2087,62 @@ type KeyInfoResult struct {
 	DownloadCount int                    `json:"download_count,omitempty"`
 	UsageToday    map[string]interface{} `json:"usage_today,omitempty"`
 	Error         string                 `json:"error,omitempty"`
+	// Reachable distinguishes "the server told us this key is bad" from "we could
+	// not ask" (v1.1.8 BUG-5). Both used to collapse into Valid=false, which gave
+	// the UI no way to avoid rejecting a genuinely valid key just because the
+	// user was offline. Only Reachable=true && Valid=false means "key is bad".
+	Reachable bool `json:"reachable"`
+}
+
+// ValidateKey checks an arbitrary key against the server WITHOUT persisting it,
+// so the Settings panel can refuse to save a key that does not work (BUG-5).
+// GetKeyInfo() validates whatever is already in config; this validates a
+// candidate the user just pasted.
+func (a *App) ValidateKey(key string) KeyInfoResult {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return KeyInfoResult{Valid: false, Reachable: true, Error: "Enter a key first."}
+	}
+	return a.validateKeyAgainstServer(key)
+}
+
+// validateKeyAgainstServer performs the actual /api/keys/validate round-trip.
+func (a *App) validateKeyAgainstServer(key string) KeyInfoResult {
+	manifest := loadEndpointManifest()
+	tidalURL := strings.TrimRight(manifest.Mirrors.Tidal, "/")
+	if tidalURL == "" {
+		return KeyInfoResult{Valid: false, Reachable: false, Error: "Could not reach Antra servers."}
+	}
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, tidalURL+"/api/keys/validate", nil)
+	if err != nil {
+		return KeyInfoResult{Valid: false, Reachable: false, Error: err.Error()}
+	}
+	req.Header.Set("X-API-Key", key)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return KeyInfoResult{Valid: false, Reachable: false, Error: "Could not reach Antra servers."}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 403 || resp.StatusCode == 401 {
+		// The server answered — this key is genuinely not recognised.
+		return KeyInfoResult{Valid: false, Reachable: true, Error: "Key not recognized."}
+	}
+	if resp.StatusCode != 200 {
+		// Server reachable but unhealthy — treat as "could not verify", not "bad key".
+		return KeyInfoResult{Valid: false, Reachable: false,
+			Error: fmt.Sprintf("Server returned %d.", resp.StatusCode)}
+	}
+
+	var result KeyInfoResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return KeyInfoResult{Valid: false, Reachable: false, Error: "Unexpected response from server."}
+	}
+	result.Reachable = true
+	return result
 }
 
 // GetKeyInfo validates the currently configured Antra API key against the VPS
@@ -1818,46 +2152,21 @@ type KeyInfoResult struct {
 func (a *App) GetKeyInfo() KeyInfoResult {
 	cfg := a.GetConfig()
 	key := strings.TrimSpace(cfg.AntraApiKey)
+	if strings.HasPrefix(key, "at_") {
+		// A device token is not a keys.json entry, so /api/keys/validate would
+		// answer 403 and the UI would report "Key not recognized" — the BUG this
+		// separation fixes. Device tokens are checked via /api/device/status.
+		key = ""
+	}
 	if key == "" {
 		// Try manifest key as fallback
 		manifest := loadEndpointManifest()
 		key = strings.TrimSpace(manifest.ApiKey)
 	}
 	if key == "" {
-		return KeyInfoResult{Valid: false, Error: "No API key configured."}
+		return KeyInfoResult{Valid: false, Reachable: true, Error: "No API key configured."}
 	}
-
-	manifest := loadEndpointManifest()
-	tidalURL := strings.TrimRight(manifest.Mirrors.Tidal, "/")
-	if tidalURL == "" {
-		return KeyInfoResult{Valid: false, Error: "Could not reach Antra servers."}
-	}
-
-	client := &http.Client{Timeout: 8 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, tidalURL+"/api/keys/validate", nil)
-	if err != nil {
-		return KeyInfoResult{Valid: false, Error: err.Error()}
-	}
-	req.Header.Set("X-API-Key", key)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return KeyInfoResult{Valid: false, Error: "Could not reach Antra servers."}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 403 {
-		return KeyInfoResult{Valid: false, Error: "API key is invalid or expired."}
-	}
-	if resp.StatusCode != 200 {
-		return KeyInfoResult{Valid: false, Error: fmt.Sprintf("Server returned %d.", resp.StatusCode)}
-	}
-
-	var result KeyInfoResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return KeyInfoResult{Valid: false, Error: "Unexpected response from server."}
-	}
-	return result
+	return a.validateKeyAgainstServer(key)
 }
 
 // SaveCoverArt downloads the album/playlist cover art at maximum resolution

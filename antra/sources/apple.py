@@ -18,6 +18,7 @@ from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.sources.base import BaseSourceAdapter, RateLimitedError
 from antra.sources.odesli import OdesliEnricher
 from antra.core.apple_fetcher import AppleFetcher
+from antra.utils.matching import score_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -494,6 +495,12 @@ class _DirectAppleClient:
 _APPLE_API_REQUEST_SPACING_SECONDS = 2.5
 _APPLE_429_RETRY_DELAYS = (3.0, 6.0, 10.0)
 
+# Read timeout for GET /api/track/{id}. The mirror does real work behind this
+# call — HLS master fetch plus licence, across an account pool with 2-5s
+# politeness waits — so it is slow by design, not by fault. Measured at 16.09s
+# from a residential connection against the previous 20s limit.
+_APPLE_TRACK_TIMEOUT = 60
+
 # On Windows, prevent subprocess from flashing a console window
 _SUBPROCESS_FLAGS = {}
 if sys.platform == "win32":
@@ -533,6 +540,7 @@ class AppleAdapter(BaseSourceAdapter):
         })
         self._preferred_output_format = (preferred_output_format or "source").lower()
         self._prefer_lossy_download = self._preferred_output_format in {"aac", "mp3", "m4a"}
+        self._atmos_requested = self._preferred_output_format == "atmos-apple"
         self._require_lossless_download = self._preferred_output_format in {
             "flac", "lossless", "alac",
             "lossless-16", "lossless-24",
@@ -646,24 +654,26 @@ class AppleAdapter(BaseSourceAdapter):
         songs = [s for s in r.json().get("results", []) if s.get("kind") == "song"]
         if not songs:
             return None
-        title_lower = title.lower()
-        artist_lower = artist.lower()
 
-        def _score(song: dict) -> int:
-            song_title = song.get("trackName", "").lower()
-            song_artist = song.get("artistName", "").lower()
-            score = 0
-            if title_lower == song_title:
-                score += 3
-            elif title_lower in song_title or song_title in title_lower:
-                score += 2
-            if artist_lower and (artist_lower in song_artist or song_artist in artist_lower):
-                score += 1
-            return score
+        # Pick by real similarity (version-aware: an instrumental/karaoke hit is
+        # capped below the floor by score_similarity) instead of the old crude
+        # substring scoring, which accepted "Song (Karaoke Version)" by a wrong
+        # artist as long as the title overlapped (v1.1.8 BUG-1).
+        from antra.utils.matching import score_similarity as _score_sim
+
+        def _score(song: dict) -> float:
+            return _score_sim(
+                query_title=title,
+                query_artists=[artist] if artist else [],
+                result_title=song.get("trackName", ""),
+                result_artist=song.get("artistName", ""),
+            )
 
         best = max(songs, key=_score)
-        # Require at least a title overlap so we don't return a random hit.
-        return best if _score(best) >= 2 else None
+        return best if _score(best) >= 0.60 else None
+
+    def _requires_atmos(self) -> bool:
+        return self._atmos_requested
 
     def is_available(self) -> bool:
         try:
@@ -718,6 +728,14 @@ class AppleAdapter(BaseSourceAdapter):
         sample_rate: Optional[int] = None
         isrc_match = False
         lossless_hint = False
+        # Honest confidence per resolution path (v1.1.8 BUG-1): previously every
+        # path — including bare text search — claimed similarity_score=1.0 and
+        # echoed the requested metadata, so the resolver could never tell an
+        # exact platform ID from a fuzzy text hit.
+        similarity: float = 1.0
+        matched_title: str = track.title
+        matched_artists: list[str] = list(track.artists or [])
+        matched_duration_ms: Optional[int] = track.duration_ms
         track_traits = [str(trait).lower() for trait in (getattr(track, "audio_traits", None) or [])]
 
         # Preserve quality information already discovered from the Apple URL itself.
@@ -803,6 +821,8 @@ class AppleAdapter(BaseSourceAdapter):
                 platform_ids = self._odesli.resolve(track)
                 apple_id = platform_ids.get("appleMusic")
                 if apple_id:
+                    # Cross-platform link index — strong but not an ISRC verification.
+                    similarity = 0.90
                     logger.info(f"[Apple] Odesli resolved Apple Music ID: {apple_id} for '{track.title}'")
                 else:
                     logger.warning(f"[Apple] Odesli found no Apple Music ID for '{track.title}'")
@@ -815,8 +835,26 @@ class AppleAdapter(BaseSourceAdapter):
             try:
                 song = self._direct.search_text_track(track.title, track.primary_artist)
                 if song:
-                    apple_id = str(song.get("trackId") or "")
-                    logger.info(f"[Apple-Direct] Text search found track_id={apple_id} for '{track.title}'")
+                    text_score = score_similarity(
+                        query_title=track.title,
+                        query_artists=track.artists,
+                        result_title=song.get("trackName", ""),
+                        result_artist=song.get("artistName", ""),
+                    )
+                    if text_score >= 0.60:
+                        apple_id = str(song.get("trackId") or "")
+                        similarity = text_score
+                        matched_title = song.get("trackName") or matched_title
+                        if song.get("artistName"):
+                            matched_artists = [song["artistName"]]
+                        if song.get("trackTimeMillis"):
+                            matched_duration_ms = int(song["trackTimeMillis"])
+                        logger.info(f"[Apple-Direct] Text search found track_id={apple_id} for '{track.title}' (score={text_score:.2f})")
+                    else:
+                        logger.info(
+                            "[Apple-Direct] Text search hit rejected for '%s' — '%s' by '%s' (score=%.2f)",
+                            track.title, song.get("trackName", ""), song.get("artistName", ""), text_score,
+                        )
             except Exception as e:
                 logger.warning(f"[Apple-Direct] Text search failed: {e}")
 
@@ -831,9 +869,32 @@ class AppleAdapter(BaseSourceAdapter):
                 )
                 if r.status_code == 200:
                     data = r.json()
-                    apple_id = data.get("track_id")
-                    bit_depth, sample_rate = self._coerce_lossless_metadata(data, bit_depth, sample_rate)
-                    logger.info(f"[Apple] Text search found track_id={apple_id} for '{track.title}'")
+                    proxy_title = str(data.get("title") or "")
+                    proxy_artist = str(data.get("artist") or "")
+                    if proxy_title or proxy_artist:
+                        text_score = score_similarity(
+                            query_title=track.title,
+                            query_artists=track.artists,
+                            result_title=proxy_title,
+                            result_artist=proxy_artist,
+                        )
+                    else:
+                        # Proxy did not echo the matched metadata — moderate trust.
+                        text_score = 0.70
+                    if text_score >= 0.60:
+                        apple_id = data.get("track_id")
+                        similarity = text_score
+                        if proxy_title:
+                            matched_title = proxy_title
+                        if proxy_artist:
+                            matched_artists = [proxy_artist]
+                        bit_depth, sample_rate = self._coerce_lossless_metadata(data, bit_depth, sample_rate)
+                        logger.info(f"[Apple] Text search found track_id={apple_id} for '{track.title}' (score={text_score:.2f})")
+                    else:
+                        logger.info(
+                            "[Apple] Text search hit rejected for '%s' — '%s' by '%s' (score=%.2f)",
+                            track.title, proxy_title, proxy_artist, text_score,
+                        )
                 else:
                     logger.warning(f"[Apple] Text search HTTP {r.status_code} for '{track.title}'")
             except Exception as e:
@@ -851,8 +912,19 @@ class AppleAdapter(BaseSourceAdapter):
                 if song:
                     apple_id = str(song.get("trackId") or "")
                     if apple_id:
+                        similarity = score_similarity(
+                            query_title=track.title,
+                            query_artists=track.artists,
+                            result_title=song.get("trackName", ""),
+                            result_artist=song.get("artistName", ""),
+                        )
+                        matched_title = song.get("trackName") or matched_title
+                        if song.get("artistName"):
+                            matched_artists = [song["artistName"]]
+                        if song.get("trackTimeMillis"):
+                            matched_duration_ms = int(song["trackTimeMillis"])
                         logger.info(
-                            f"[Apple] Public iTunes search found track_id={apple_id} for '{track.title}'"
+                            f"[Apple] Public iTunes search found track_id={apple_id} for '{track.title}' (score={similarity:.2f})"
                         )
             except Exception as e:
                 logger.warning(f"[Apple] Public iTunes search failed: {e}")
@@ -899,10 +971,10 @@ class AppleAdapter(BaseSourceAdapter):
 
         return SearchResult(
             source="apple",
-            title=track.title,
-            artists=track.artists,
+            title=matched_title,
+            artists=matched_artists,
             album=track.album,
-            duration_ms=track.duration_ms,
+            duration_ms=matched_duration_ms,
             audio_format=audio_format,
             quality_kbps=quality_kbps,
             is_lossless=is_lossless,
@@ -910,7 +982,7 @@ class AppleAdapter(BaseSourceAdapter):
             sample_rate_hz=sample_rate,
             download_url=None,
             stream_id=str(apple_id),
-            similarity_score=1.0,
+            similarity_score=similarity,
             isrc_match=isrc_match,
         )
 
@@ -946,26 +1018,62 @@ class AppleAdapter(BaseSourceAdapter):
             raise ValueError("[Apple] Missing Apple track_id in search result")
 
         # ── Path 1: wrapper lossless ALAC via /api/stream/ ────────────────────
-        # Skipped for alac / alac-24: the wrapper bridge fetches enhancedHls
-        # (standard 16-bit ALAC). Path 3 uses highResLossless → 24-bit ALAC.
-        # For alac-16, or when not in lossless mode, the wrapper is fine.
-        _want_hires_alac = self._preferred_output_format in {"alac", "alac-24"}
-        if not self._prefer_lossy_download and self._mirrors and (
-            not self.always_lossy and not _want_hires_alac
-        ):
+        # The wrapper is the ONLY reliable ALAC path. Apple serves most catalog
+        # masters as FairPlay-only, and Path 3 (/api/track/, Widevine CENC) then
+        # answers `503 Apple variant exposed FairPlay-only SAMPLE-AES keys
+        # without Widevine CENC for this track` — measured live. OPERATIONS.md
+        # says the same thing: "ALAC routes exclusively through the wrapper pool".
+        #
+        # v1.1.6 skipped this path for alac/alac-24 on the premise that the
+        # wrapper only serves enhancedHls (16-bit) and that Path 3's
+        # highResLossless was needed for 24-bit. **That premise is obsolete** —
+        # the wrapper was rebuilt around gamdl's amdecrypt writer and now serves
+        # hi-res directly: OPERATIONS.md records "91 MB ALAC, 96 kHz/24-bit,
+        # 264 s". So the carve-out bought nothing and cost every FairPlay-only
+        # track, which is why ALAC failed outright on desktop while the website
+        # — which has no such gate — worked. The gate is gone; this now matches
+        # Antra-Web exactly.
+        if self._requires_atmos() or (not self._prefer_lossy_download and self._mirrors
+                                      and not self.always_lossy):
             try:
                 mirror = self._get_working_mirror()
                 stream_url = f"{mirror}/api/stream/{track_id}"
-                logger.info(f"[Apple] Downloading ALAC via wrapper stream: {stream_url}")
+                _atmos = self._requires_atmos()
+                logger.info(
+                    "[Apple] Downloading %s via stream: %s",
+                    "Dolby Atmos (EC-3)" if _atmos else "ALAC", stream_url,
+                )
 
-                resp = self._api_get(stream_url, timeout=300, stream=True)
+                resp = self._api_get(
+                    stream_url,
+                    params={"format": "atmos"} if _atmos else None,
+                    timeout=300, stream=True,
+                )
                 if resp.status_code == 200:
-                    final_path = output_path + ".m4a"
+                    # Atmos MUST be written to .mp4, never .m4a — ffmpeg's `ipod`
+                    # muxer refuses EC-3/AC-4. Documented in OPERATIONS.md §6 and
+                    # it has already bitten two codebases (v1.1.8 FEAT-1).
+                    final_path = output_path + (".mp4" if _atmos else ".m4a")
                     os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
-                    with open(final_path, "wb") as f:
-                        for chunk in resp.iter_content(131072):
-                            if chunk:
-                                f.write(chunk)
+                    # Atomic write (v1.1.8 BUG-4): the wrapper stream can die
+                    # mid-transfer and previously left a partial, untagged .m4a
+                    # in the library (the "1.2 MB won't play" report).
+                    # Derived from output_path (the stem), not final_path — see the
+                    # note in qobuz_mirror: a longer temp name can breach Windows
+                    # MAX_PATH and break a download that would otherwise succeed.
+                    _part_path = output_path + ".part"
+                    try:
+                        with open(_part_path, "wb") as f:
+                            for chunk in resp.iter_content(131072):
+                                if chunk:
+                                    f.write(chunk)
+                        os.replace(_part_path, final_path)
+                    except BaseException:
+                        try:
+                            os.remove(_part_path)
+                        except OSError:
+                            pass
+                        raise
 
                     # Update result metadata from response headers
                     codec       = resp.headers.get("X-Codec", "alac").lower()
@@ -1075,7 +1183,15 @@ class AppleAdapter(BaseSourceAdapter):
                     resp = self._api_get(
                         api_url,
                         params={"prefer_lossy": "true"} if self._prefer_lossy_download else None,
-                        timeout=20,
+                        # 20s was too tight over Cloudflare: this endpoint fetches
+                        # the HLS master and licence server-side, rotating accounts
+                        # with 2-5s politeness waits between them. Measured at
+                        # 16.09s from a residential connection — inside the old
+                        # limit only by luck, and it surfaced as
+                        # "All mirrors failed ... Read timed out (read timeout=20)".
+                        # The website never hit this because it reaches the mirror
+                        # over localhost.
+                        timeout=_APPLE_TRACK_TIMEOUT,
                     )
                     if resp.status_code != 429:
                         break

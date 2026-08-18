@@ -24,6 +24,8 @@ from antra.sources.base import BaseSourceAdapter, RateLimitedError
 from antra.sources.odesli import OdesliEnricher
 from antra.utils.matching import score_similarity, duration_close
 
+from antra.utils.mirror_http import TlsFallbackSession, humanize_network_error
+
 logger = logging.getLogger(__name__)
 
 MIN_SIMILARITY = 0.60
@@ -49,7 +51,10 @@ class TidalMirrorAdapter(BaseSourceAdapter):
 
     def __init__(self, mirror_url: str, api_key: str = "", preferred_output_format: str = "source"):
         self._base = mirror_url.rstrip("/")
-        self._session = requests.Session()
+        # v1.1.8 BUG-2: TLS-resilient session (curl_cffi fallback + proxy
+        # diagnostics). Lifted from the Amazon adapter so all mirrors
+        # behave the same on hostile networks.
+        self._session = TlsFallbackSession("TidalMirror")
         self._session.headers.update({
             "User-Agent": "Antra/1.0",
             "Accept": "application/json",
@@ -74,11 +79,19 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             return False
         return self._preferred_output_format in {"lossless-16", "alac-16"}
 
+    def _requires_atmos(self) -> bool:
+        return self._preferred_output_format == "atmos-tidal"
+
     def _stream_params(self) -> Optional[dict]:
         """Quality query params for the mirror's /api/stream and /api/track calls.
         strict_24 (24-bit) and prefer_16 (native 16-bit LOSSLESS) are mutually exclusive.
         The transcoder still downsamples as a safety net if a 24-bit file arrives in
         16-bit mode (e.g. a legacy default-client session in the pool)."""
+        # Dolby Atmos (v1.1.8 FEAT-1) overrides the bit-depth params entirely: the
+        # Atmos mix is E-AC-3, not FLAC, so strict_24/prefer_16 are meaningless
+        # here and would make the server reject a perfectly good Atmos stream.
+        if self._requires_atmos():
+            return {"format": "atmos"}
         if self._requires_strict_24bit():
             return {"strict_24": "1"}
         if self._requires_16bit():
@@ -168,6 +181,11 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         if not best_item or best_score < 0.72:
             return None
 
+        # Honest confidence (v1.1.8 BUG-1): this is a fuzzy title match inside a
+        # cached album mapping, NOT an ISRC verification. It used to be stamped
+        # similarity_score=1.0 + isrc_match=True, so one wrong album mapping
+        # poisoned every subsequent track of that album with unconditionally
+        # trusted wrong matches.
         return SearchResult(
             source=self.name,
             title=best_item.get("title", ""),
@@ -181,8 +199,8 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             sample_rate_hz=None,
             download_url=None,
             stream_id=str(best_item["track_id"]),
-            similarity_score=1.0,
-            isrc_match=True,
+            similarity_score=min(best_score, 0.99),
+            isrc_match=False,
             is_explicit=best_item.get("explicit") if isinstance(best_item.get("explicit"), bool) else None,
         )
 
@@ -240,6 +258,26 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 source_metadata=sm,
             )
 
+        # ISRC exact match FIRST — before Odesli.
+        #
+        # Order matters and this used to be the other way round. A single ISRC can
+        # map to SEVERAL Tidal track ids (the original single vs the album vs a
+        # deluxe reissue), and they do NOT all carry the same master. The mirror's
+        # /api/search/isrc endpoint is quality-aware — `_find_track_by_isrc` probes
+        # every candidate and prefers HI_RES_LOSSLESS (v1.1.7). Odesli is just a
+        # cross-platform link index with no notion of quality, and in practice it
+        # returns the original single.
+        #
+        # Measured on Baby Keem - hooligan (ISRC USSM12005478):
+        #   Odesli        -> 155027264  "hooligan / sons & critics"  LOSSLESS 16/44.1
+        #   ISRC search   -> 256716935  "The Melodic Blue (Deluxe)"  HI_RES  24/48
+        # Odesli running first is what made the desktop download 16-bit and then
+        # report "no 24-bit master on Tidal" — true of that id, wrong about the track.
+        if track.isrc:
+            result = self._search_by_isrc(track.isrc, track)
+            if result is not None:
+                return result
+
         # Spotify links can fail over poorly after a Qobuz stream error because
         # they may have no ISRC and Tidal text search is much weaker than an
         # exact cross-platform mapping. Odesli/Songwhip already cache these IDs,
@@ -250,7 +288,17 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 tidal_id = platform_ids.get("tidal")
                 if tidal_id:
                     logger.info("[TidalMirror] Odesli resolved Tidal track ID %s for '%s'", tidal_id, track.title)
+                    # Odesli picked *a* release, not necessarily the best-mastered
+                    # one. The resolved track's own Tidal metadata carries its ISRC,
+                    # so we can upgrade to the best release even when the incoming
+                    # track had no ISRC of its own — which is the common case when
+                    # Spotify metadata came from the public (no-ISRC) path.
+                    upgraded = self._upgrade_via_isrc(str(tidal_id), track)
+                    if upgraded is not None:
+                        return upgraded
                     sm = {"isrc": track.isrc} if track.isrc else {}
+                    # Cross-platform link index — strong, but no ISRC lookup was
+                    # actually performed here, so don't claim one (v1.1.8 BUG-1).
                     return SearchResult(
                         source=self.name,
                         title=track.title,
@@ -264,66 +312,13 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                         sample_rate_hz=None,
                         download_url=None,
                         stream_id=str(tidal_id),
-                        similarity_score=1.0,
-                        isrc_match=bool(track.isrc),
+                        similarity_score=0.90,
+                        isrc_match=False,
                         is_explicit=track.is_explicit,
                         source_metadata=sm,
                     )
             except Exception as e:
                 logger.debug("[TidalMirror] Odesli Tidal ID lookup failed: %s", e)
-
-        # ISRC exact match via mirror's search endpoint
-        if track.isrc:
-            try:
-                r = self._session.get(
-                    f"{self._base}/api/search/isrc/{track.isrc}",
-                    timeout=10,
-                )
-                if r.status_code == 429:
-                    raise RateLimitedError("Tidal mirror rate limited (429)")
-                if r.status_code in (401, 403):
-                    # Key invalid — log once and return None (don't disable permanently)
-                    logger.warning("[TidalMirror] API key rejected (%d) — check key on server", r.status_code)
-                    return None
-                if r.status_code == 503:
-                    self._reset_availability()
-                    return None
-                if r.status_code == 200:
-                    data = r.json()
-                    result = self._build_result(data, isrc_match=True)
-                    if self._has_severe_duration_mismatch(track.duration_ms, result.duration_ms):
-                        logger.info(
-                            "[TidalMirror] ISRC match for '%s' rejected — severe duration mismatch "
-                            "(expected %.0fs, got %.0fs)",
-                            track.title,
-                            (track.duration_ms or 0) / 1000,
-                            (result.duration_ms or 0) / 1000,
-                        )
-                        result = None
-                    # Sanity-check duration: if the source track is significantly
-                    # shorter or longer than expected, the ISRC lookup returned the
-                    # wrong recording (e.g. Pt. 1 and Pt. 2 mapped to the same track).
-                    if track.duration_ms and result.duration_ms:
-                        if not duration_close(
-                            track.duration_ms / 1000,
-                            result.duration_ms / 1000,
-                            tolerance=30,
-                        ):
-                            logger.info(
-                                "[TidalMirror] ISRC match for '%s' rejected — "
-                                "duration mismatch (expected %.0fs, got %.0fs)",
-                                track.title,
-                                track.duration_ms / 1000,
-                                result.duration_ms / 1000,
-                            )
-                            result = None
-                    if result is not None:
-                        self._cache_album_id_from_track(track, str(data.get("track_id") or result.stream_id or ""))
-                        return result
-            except RateLimitedError:
-                raise
-            except Exception as e:
-                logger.debug("[TidalMirror] ISRC search failed: %s", e)
 
         cached_album_result = self._search_cached_album(track)
         if cached_album_result is not None:
@@ -373,6 +368,134 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         if best and best_score >= MIN_SIMILARITY:
             return best
         return None
+
+    def _search_by_isrc(self, isrc: str, track: TrackMetadata) -> Optional[SearchResult]:
+        """Exact ISRC match via the mirror, with duration sanity checks.
+
+        Extracted so both the primary path and the post-Odesli upgrade can use it
+        rather than keeping two copies of the duration-guard logic.
+        """
+        try:
+            r = self._session.get(
+                f"{self._base}/api/search/isrc/{isrc}",
+                timeout=10,
+            )
+            if r.status_code == 429:
+                raise RateLimitedError("Tidal mirror rate limited (429)")
+            if r.status_code in (401, 403):
+                # Key invalid — log once and return None (don't disable permanently)
+                logger.warning("[TidalMirror] API key rejected (%d) — check key on server", r.status_code)
+                return None
+            if r.status_code == 503:
+                self._reset_availability()
+                return None
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            result = self._build_result(data, isrc_match=True)
+            # /api/search/isrc does NOT return a duration, so result.duration_ms is
+            # None and BOTH guards below would be skipped — they are written as
+            # `if track.duration_ms and result.duration_ms`. That silently made this
+            # an unverified path, which matters much more now that ISRC search runs
+            # FIRST: an ISRC can legitimately point at a different recording (a live
+            # cut, an extended mix). Observed: Take Five resolved to a 695s take for
+            # a 324s request and was accepted. Fetch the duration so the guards can
+            # actually do their job.
+            if result.duration_ms is None and track.duration_ms and result.stream_id:
+                try:
+                    mr = self._session.get(
+                        f"{self._base}/api/meta/track/{result.stream_id}", timeout=10
+                    )
+                    if mr.status_code == 200:
+                        secs = (mr.json() or {}).get("duration")
+                        if secs:
+                            result.duration_ms = int(float(secs) * 1000)
+                except Exception as e:
+                    logger.debug("[TidalMirror] ISRC duration verification failed: %s", e)
+                if result.duration_ms is None:
+                    # Could not verify. Refuse rather than accept blind — the
+                    # Odesli/text-search paths below are duration-checked.
+                    logger.info(
+                        "[TidalMirror] ISRC match for '%s' not accepted — duration could "
+                        "not be verified.", track.title,
+                    )
+                    return None
+            if self._has_severe_duration_mismatch(track.duration_ms, result.duration_ms):
+                logger.info(
+                    "[TidalMirror] ISRC match for '%s' rejected — severe duration mismatch "
+                    "(expected %.0fs, got %.0fs)",
+                    track.title,
+                    (track.duration_ms or 0) / 1000,
+                    (result.duration_ms or 0) / 1000,
+                )
+                return None
+            # Sanity-check duration: if the source track is significantly
+            # shorter or longer than expected, the ISRC lookup returned the
+            # wrong recording (e.g. Pt. 1 and Pt. 2 mapped to the same track).
+            if track.duration_ms and result.duration_ms:
+                if not duration_close(
+                    track.duration_ms / 1000,
+                    result.duration_ms / 1000,
+                    tolerance=30,
+                ):
+                    logger.info(
+                        "[TidalMirror] ISRC match for '%s' rejected — "
+                        "duration mismatch (expected %.0fs, got %.0fs)",
+                        track.title,
+                        track.duration_ms / 1000,
+                        result.duration_ms / 1000,
+                    )
+                    return None
+            self._cache_album_id_from_track(track, str(data.get("track_id") or result.stream_id or ""))
+            return result
+        except RateLimitedError:
+            raise
+        except Exception as e:
+            logger.debug("[TidalMirror] ISRC search failed: %s", e)
+        return None
+
+    def _upgrade_via_isrc(self, tidal_id: str, track: TrackMetadata) -> Optional[SearchResult]:
+        """Given a Tidal id Odesli picked, look for a better-mastered release.
+
+        Odesli maps a track to one release with no regard for mastering, so it
+        routinely lands on the 16-bit single when a 24-bit album cut exists. The
+        resolved track's OWN Tidal metadata carries the ISRC, so we can run the
+        quality-aware ISRC search even when the incoming track has no ISRC — which
+        is exactly the case when Spotify metadata came from the public path.
+
+        Returns None (caller keeps Odesli's id) whenever this cannot be improved
+        confidently: no ISRC available, lookup failed, or it resolved to the same
+        id. Deliberately conservative — a wrong "upgrade" is worse than 16-bit.
+        """
+        isrc = (track.isrc or "").strip()
+        if not isrc:
+            try:
+                r = self._session.get(f"{self._base}/api/meta/track/{tidal_id}", timeout=10)
+                if r.status_code == 200:
+                    isrc = (r.json().get("isrc") or "").strip()
+            except Exception as e:
+                logger.debug("[TidalMirror] ISRC upgrade: metadata lookup failed: %s", e)
+                return None
+        if not isrc:
+            return None
+
+        try:
+            better = self._search_by_isrc(isrc, track)
+        except RateLimitedError:
+            raise
+        except Exception:
+            return None
+        if better is None or not better.stream_id:
+            return None
+        if str(better.stream_id) == str(tidal_id):
+            return None
+
+        logger.info(
+            "[TidalMirror] ISRC %s maps to a better release: %s -> %s (%s)",
+            isrc, tidal_id, better.stream_id,
+            f"{better.bit_depth}-bit" if better.bit_depth else "quality per mirror",
+        )
+        return better
 
     def _build_result(self, data: dict, isrc_match: bool = False) -> SearchResult:
         """Build SearchResult from ISRC search response."""
@@ -468,10 +591,24 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 except Exception:
                     pass
                 if self._requires_strict_24bit():
-                    raise RuntimeError(f"[TidalMirror] Quality mismatch (strict 24-bit): {detail or track_id}")
+                    raise RuntimeError(self._strict24_message(track_id, detail))
                 else:
                     raise RuntimeError(f"[TidalMirror] Quality mismatch (lossless unavailable): {detail or track_id}")
             if r.status_code == 404:
+                # In Atmos mode a 404 does NOT mean the track is missing — the
+                # server returns it when the track has no Dolby Atmos mix, or when
+                # the session it used lacks Spatial Audio. Reporting that as
+                # "not found on Tidal" sent users hunting for the wrong problem.
+                if self._requires_atmos():
+                    detail = ""
+                    try:
+                        detail = r.json().get("detail", "")
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"[TidalMirror] No Dolby Atmos stream for track {track_id}"
+                        + (f": {detail}" if detail else "")
+                    )
                 raise RuntimeError(f"[TidalMirror] Track {track_id} not found on Tidal")
             if r.status_code == 200:
                 stream_quality = r.headers.get("X-Quality", "").upper()
@@ -503,7 +640,16 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                         f"got {stream_quality}, need HI_RES_LOSSLESS"
                     )
                 codec = r.headers.get("X-Codec", "flac").lower()
-                ext = ".flac" if "flac" in codec else ".m4a"
+                # Dolby EC-3/AC-4 must carry a `.mp4` extension, never `.m4a`:
+                # anything that later runs it through ffmpeg picks the strict
+                # `ipod` muxer for `.m4a`, which rejects those codecs outright
+                # (OPERATIONS.md section 6).
+                if "flac" in codec:
+                    ext = ".flac"
+                elif any(c in codec for c in ("ec-3", "ec3", "eac3", "ac-4", "ac4")):
+                    ext = ".mp4"
+                else:
+                    ext = ".m4a"
                 final_path = output_path + ext
                 os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
                 total_bytes = 0
@@ -588,7 +734,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 except Exception:
                     pass
                 if self._requires_strict_24bit():
-                    raise RuntimeError(f"[TidalMirror] Quality mismatch (strict 24-bit): {detail or track_id}")
+                    raise RuntimeError(self._strict24_message(track_id, detail))
                 else:
                     raise RuntimeError(f"[TidalMirror] Quality mismatch (lossless unavailable): {detail or track_id}")
             r.raise_for_status()
@@ -675,6 +821,26 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             return final_path
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+    @staticmethod
+    def _strict24_message(track_id, detail: str) -> str:
+        """Build the user-facing strict-24 error text.
+
+        The substring "Quality mismatch (strict 24-bit)" is load-bearing —
+        should_retry_download() and should_exclude_adapter_after_failure() match on
+        it — so BOTH variants keep it verbatim and only the trailing wording differs.
+        The server now distinguishes "this track has no 24-bit master" (a catalog
+        fact) from "the session pool could not confirm 24-bit right now" (a pool
+        condition). Reporting the second as the first is what made a track the user
+        could plainly see as MAX in the Tidal app come back as "not available".
+        """
+        if "could not confirm" in (detail or "").lower():
+            return (
+                "[TidalMirror] Quality mismatch (strict 24-bit) — UNCONFIRMED, "
+                f"session pool busy: {detail or track_id}"
+            )
+        return f"[TidalMirror] Quality mismatch (strict 24-bit): {detail or track_id}"
 
     def should_retry_download(self, result: SearchResult, error: Exception) -> bool:
         """Don't retry definitive failures — only transient ones."""
@@ -804,10 +970,20 @@ def _extract_tidal_source_meta(data: dict) -> dict:
             meta["disc_number"] = int(dn)
         except (TypeError, ValueError):
             pass
-    art = (data.get("album") or {}).get("cover") or (data.get("album") or {}).get("imageCoverUrl")
+    # `album` is an OBJECT on /api/meta/track/{id} but a plain STRING on
+    # /api/search/isrc/{isrc}. Calling .get() on the string raised
+    # "'str' object has no attribute 'get'", which the caller swallowed at debug
+    # level — so every ISRC match was silently discarded and the adapter fell
+    # through to Odesli's arbitrary release pick. That is what made the desktop
+    # download the 16-bit single while the website (Tidal URL -> known id) got
+    # the 24-bit album cut.
+    album = data.get("album")
+    if not isinstance(album, dict):
+        album = {}
+    art = album.get("cover") or album.get("imageCoverUrl")
     if art:
         meta["artwork_url"] = art
-    rd = data.get("release_date") or (data.get("album") or {}).get("releaseDate") or ""
+    rd = data.get("release_date") or album.get("releaseDate") or ""
     if rd:
         meta["release_date"] = rd[:10] if len(rd) >= 10 else rd
     return meta

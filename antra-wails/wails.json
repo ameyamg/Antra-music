@@ -9,5 +9,12 @@
   "author": {
     "name": "anandprtp",
     "email": "pratapanand67@gmail.com"
+  },
+  "info": {
+    "companyName": "AntraVerse",
+    "productName": "Antra",
+    "productVersion": "1.1.8",
+    "copyright": "Copyright © 2026 AntraVerse",
+    "comments": "Lossless music library downloader"
   }
 }

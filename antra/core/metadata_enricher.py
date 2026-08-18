@@ -30,6 +30,26 @@ logger = logging.getLogger(__name__)
 _enrich_cache: dict[str, dict[str, Any]] = {}
 _enrich_cache_lock = threading.Lock()
 
+# Parenthetical/bracketed version tags (e.g. "(Atmos Mix)", "(Dolby Atmos)",
+# "(2019 Remaster)", "(Radio Edit)") break Deezer/iTunes/MusicBrainz lookups —
+# those catalogs index the base recording, not the spatial/remaster variant.
+# Strip them from the *search query* only; the real title on the track is kept.
+_VERSION_SUFFIX_RE = _re.compile(
+    r"\s*[\(\[][^\(\)\[\]]*\b"
+    r"(?:atmos|dolby|spatial|mix|version|remaster(?:ed)?|edit|mono|stereo|remix)\b"
+    r"[^\(\)\[\]]*[\)\]]",
+    _re.IGNORECASE,
+)
+
+
+def _clean_search_title(title: str) -> str:
+    """Drop version/mix/remaster suffixes so catalog lookups hit the base track."""
+    if not title:
+        return title
+    cleaned = _VERSION_SUFFIX_RE.sub("", title).strip()
+    cleaned = _re.sub(r"\s{2,}", " ", cleaned).strip(" -–—")
+    return cleaned or title
+
 
 def _cache_key(track: "TrackMetadata", has_source_meta: bool = False) -> str:
     isrc = (track.isrc or "").strip().upper()
@@ -51,6 +71,7 @@ class MetadataEnricher:
     def enrich(
         track: "TrackMetadata",
         result: Optional["SearchResult"] = None,
+        fetch_lyrics: bool = True,
     ) -> None:
         """Enrich track in-place.  Never raises — silently degrades on any failure.
 
@@ -83,9 +104,14 @@ class MetadataEnricher:
             _enrich_from_deezer(track, enriched, diagnostics["deezer"])
             _enrich_from_itunes(track, enriched, diagnostics["itunes"])
             _enrich_from_musicbrainz(track, enriched, diagnostics["musicbrainz"])
+            # Year is often still missing even after the above (e.g. the Deezer
+            # text-search hit carried no album release_date). If we now have an
+            # ISRC, do one authoritative Deezer-by-ISRC lookup just for the year.
+            _ensure_release_year(track, enriched)
 
             # 3 ── Lyrics ──────────────────────────────────────────────────
-            _enrich_lyrics(track, enriched)
+            if fetch_lyrics:
+                _enrich_lyrics(track, enriched)
 
             # 4 ── Artwork upgrade ─────────────────────────────────────────
             _upgrade_artwork(track, enriched)
@@ -185,11 +211,12 @@ def _enrich_from_deezer(track: "TrackMetadata", out: dict[str, Any], diag: Optio
 
     artist = track.artists[0]
     title = track.title
+    search_title = _clean_search_title(title)
 
     try:
         resp = _req.get(
             "https://api.deezer.com/search",
-            params={"q": f'artist:"{artist}" track:"{title}"', "limit": 5},
+            params={"q": f'artist:"{artist}" track:"{search_title}"', "limit": 5},
             timeout=8,
         )
         diag["search_status"] = resp.status_code
@@ -198,7 +225,7 @@ def _enrich_from_deezer(track: "TrackMetadata", out: dict[str, Any], diag: Optio
         for hit in resp.json().get("data") or []:
             hit_title = hit.get("title") or ""
             hit_artist = (hit.get("artist") or {}).get("name") or ""
-            if _score_similarity(title, track.artists, hit_title, hit_artist) < 0.60:
+            if _score_similarity(search_title, track.artists, hit_title, hit_artist) < 0.60:
                 continue
             if needs_isrc and hit.get("isrc"):
                 track.isrc = hit["isrc"]
@@ -405,6 +432,39 @@ def _apply_album_cache(
         out["artwork_url"] = cached["artwork_url"]
 
 
+# ── Year backfill (Deezer by ISRC) ──────────────────────────────────────────
+
+
+def _ensure_release_year(track: "TrackMetadata", out: dict[str, Any]) -> None:
+    """Last-resort year fill: Deezer track-by-ISRC carries a reliable release_date.
+
+    Tidal supplies no genre/year, and the earlier passes can discover an ISRC
+    (via Deezer/iTunes text search) without ever landing a year — the search hit
+    may omit album.release_date. This single ISRC lookup closes that gap.
+    """
+    if track.release_year:
+        return
+    isrc = (track.isrc or "").strip()
+    if not isrc:
+        return
+    try:
+        import requests as _req
+        resp = _req.get(f"https://api.deezer.com/track/isrc:{isrc}", timeout=8)
+        if resp.status_code != 200:
+            return
+        data = resp.json()
+        rd = data.get("release_date") or (data.get("album") or {}).get("release_date") or ""
+        if rd and len(rd) >= 4 and rd[:4].isdigit():
+            track.release_year = int(rd[:4])
+            if not track.release_date:
+                track.release_date = rd
+            out["release_year"] = track.release_year
+            out["release_date"] = track.release_date
+            logger.debug("[MetaEnrich] Year backfill via Deezer ISRC: %s -> %s", track.title, track.release_year)
+    except Exception as e:
+        logger.debug("[MetaEnrich] Year backfill failed for %s: %s", isrc, e)
+
+
 # ── 3. iTunes Search API ────────────────────────────────────────────────────
 
 
@@ -429,11 +489,12 @@ def _enrich_from_itunes(track: "TrackMetadata", out: dict[str, Any], diag: Optio
 
     artist = track.artists[0]
     title = track.title
+    search_title = _clean_search_title(title)
 
     try:
         resp = _req.get(
             "https://itunes.apple.com/search",
-            params={"term": f"{artist} {title}", "entity": "song", "limit": 10, "country": "us"},
+            params={"term": f"{artist} {search_title}", "entity": "song", "limit": 10, "country": "us"},
             timeout=10,
         )
         diag["status"] = resp.status_code
@@ -446,7 +507,7 @@ def _enrich_from_itunes(track: "TrackMetadata", out: dict[str, Any], diag: Optio
                 continue
             hit_title = hit.get("trackName") or ""
             hit_artist = hit.get("artistName") or ""
-            sim = _score_similarity(title, track.artists, hit_title, hit_artist)
+            sim = _score_similarity(search_title, track.artists, hit_title, hit_artist)
             if sim < 0.60:
                 continue
             diag["matched_title"] = hit_title
@@ -597,6 +658,30 @@ def _mb_text_search_genre(track: "TrackMetadata", out: dict[str, Any]) -> None:
 # ── 5. Lyrics ────────────────────────────────────────────────────────────────
 
 
+def _lyrics_apple_mirrors() -> list:
+    """Apple mirror pool for the lyrics fetcher (v1.1.8 FEAT-9).
+
+    Goes through service._resolve_apple_mirrors because the pool lives in the
+    remote manifest, not in config — reading cfg.apple_mirrors directly yields
+    an empty list on a default install and silently disables Apple lyrics.
+    """
+    try:
+        from antra.core.config import load_config
+        from antra.core.service import _resolve_apple_mirrors
+        return list(_resolve_apple_mirrors(load_config()) or [])
+    except Exception:
+        return []
+
+
+def _lyrics_mirror_key() -> str:
+    try:
+        from antra.core.service import _resolve_mirror_api_key
+        from antra.core.config import load_config
+        return _resolve_mirror_api_key(load_config())
+    except Exception:
+        return ""
+
+
 def _enrich_lyrics(track: "TrackMetadata", out: dict[str, Any]) -> None:
     if track.lyrics or track.synced_lyrics:
         return
@@ -605,7 +690,13 @@ def _enrich_lyrics(track: "TrackMetadata", out: dict[str, Any]) -> None:
 
     try:
         from antra.utils.lyrics import LyricsFetcher
-        fetcher = LyricsFetcher()
+        # v1.1.8 FEAT-9: this enricher path runs for every track, so it must get
+        # the Apple mirror too — a bare LyricsFetcher() would silently skip the
+        # strongest synced-lyrics provider and quietly undo the feature.
+        fetcher = LyricsFetcher(
+            apple_mirrors=_lyrics_apple_mirrors(),
+            mirror_api_key=_lyrics_mirror_key(),
+        )
         plain, synced = fetcher.fetch(track)
         if plain:
             track.lyrics = plain
@@ -635,6 +726,7 @@ def _upgrade_artwork(track: "TrackMetadata", out: dict[str, Any]) -> None:
     title = track.title or ""
     if not artist or not title:
         return
+    search_title = _clean_search_title(title)
 
     try:
         import requests as _req
@@ -644,7 +736,7 @@ def _upgrade_artwork(track: "TrackMetadata", out: dict[str, Any]) -> None:
     try:
         resp = _req.get(
             "https://itunes.apple.com/search",
-            params={"term": f"{artist} {title}", "entity": "song", "limit": 5, "country": "us"},
+            params={"term": f"{artist} {search_title}", "entity": "song", "limit": 5, "country": "us"},
             timeout=8,
         )
         if resp.status_code != 200:
@@ -654,7 +746,7 @@ def _upgrade_artwork(track: "TrackMetadata", out: dict[str, Any]) -> None:
                 continue
             hit_title = hit.get("trackName") or ""
             hit_artist = hit.get("artistName") or ""
-            if _score_similarity(title, track.artists, hit_title, hit_artist) < 0.60:
+            if _score_similarity(search_title, track.artists, hit_title, hit_artist) < 0.60:
                 continue
             art = hit.get("artworkUrl100") or ""
             if art and _album_titles_match(track.album, hit.get("collectionName") or ""):

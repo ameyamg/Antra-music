@@ -24,6 +24,7 @@ type App struct {
 	isStopping     bool
 	ffmpegExe      string // absolute path to bundled ffmpeg (empty = use PATH)
 	ffprobeExe     string // absolute path to bundled ffprobe (empty = use PATH)
+	ffmpegOnce     sync.Once
 	mediaServer    *http.Server
 	mediaBaseURL   string
 	mediaToken     string
@@ -45,7 +46,7 @@ func (a *App) startup(ctx context.Context) {
 // occurs when the window is shown before the Svelte app has mounted.
 func (a *App) domReady(ctx context.Context) {
 	wailsRuntime.WindowShow(ctx)
-	go a.cacheFfmpegPaths()
+	go a.ensureFfmpegPaths()
 	go a.startAutoSyncTicker(ctx)
 }
 
@@ -78,10 +79,10 @@ func (a *App) maybeRunAutoSync(now time.Time) {
 		return
 	}
 	var cfg struct {
-		AutoSyncEnabled  bool `json:"auto_sync_enabled"`
-		AutoSyncHour     int  `json:"auto_sync_hour"`
-		AutoSyncMinute   int  `json:"auto_sync_minute"`
-		AutoSyncDays     int  `json:"auto_sync_days"` // bitmask: Mon=bit0 … Sun=bit6
+		AutoSyncEnabled  bool          `json:"auto_sync_enabled"`
+		AutoSyncHour     int           `json:"auto_sync_hour"`
+		AutoSyncMinute   int           `json:"auto_sync_minute"`
+		AutoSyncDays     int           `json:"auto_sync_days"` // bitmask: Mon=bit0 … Sun=bit6
 		TrackedPlaylists []interface{} `json:"tracked_playlists"`
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
@@ -93,7 +94,7 @@ func (a *App) maybeRunAutoSync(now time.Time) {
 
 	// Check day-of-week bitmask (Go: Sunday=0, but we use Monday=bit0)
 	dow := int(now.Weekday()) // 0=Sunday … 6=Saturday
-	bit := (dow + 6) % 7     // Monday=0 … Sunday=6
+	bit := (dow + 6) % 7      // Monday=0 … Sunday=6
 	if cfg.AutoSyncDays&(1<<bit) == 0 {
 		return
 	}
@@ -118,18 +119,43 @@ func (a *App) maybeRunAutoSync(now time.Time) {
 	}()
 }
 
+// ensureFfmpegPaths resolves the bundled ffmpeg/ffprobe exactly once per
+// process. It is kicked off in the background at startup so the cost is hidden,
+// but every consumer calls it too: the resolution spawns the PyInstaller
+// backend, which takes seconds on a cold machine, and an analyzer opened inside
+// that window would otherwise read an empty path and fall back to bare
+// "ffmpeg" on PATH — i.e. exactly the failure this whole path exists to avoid.
+func (a *App) ensureFfmpegPaths() {
+	a.ffmpegOnce.Do(a.cacheFfmpegPaths)
+}
+
 // cacheFfmpegPaths asks the bundled Python backend where its ffmpeg lives so
 // the Go analyzer can use a full path rather than relying on system PATH.
+//
+// It uses --export-ffmpeg, NOT --get-ffmpeg-dir. Inside the PyInstaller bundle
+// the ffmpeg binary lives in sys._MEIPASS, which is deleted the instant that
+// backend process exits — so --get-ffmpeg-dir hands back a path that is already
+// gone by the time we stat it. On a developer machine this was invisible,
+// because get_ffmpeg_exe() checks PATH first and returns a stable system path;
+// on a clean install it meant the analyzer's stats and FFT panels could never
+// work. --export-ffmpeg copies the binary somewhere persistent first.
 func (a *App) cacheFfmpegPaths() {
 	backend, err := ensureBundledBackend()
 	if err != nil {
 		return
 	}
-	cmd := exec.Command(backend, "--get-ffmpeg-dir")
+	binDir := filepath.Join(getAppDataDir(), "runtime", "ffmpeg")
+	cmd := exec.Command(backend, "--export-ffmpeg", binDir)
 	hideProcess(cmd)
 	out, err := cmd.Output()
 	if err != nil {
-		return
+		// An older backend predates --export-ffmpeg and argparse exits non-zero.
+		// Fall back so a mismatched dev tree still resolves something usable.
+		cmd = exec.Command(backend, "--get-ffmpeg-dir")
+		hideProcess(cmd)
+		if out, err = cmd.Output(); err != nil {
+			return
+		}
 	}
 	// Output is two lines: ffmpeg path, ffprobe path (either may be empty)
 	lines := strings.SplitN(strings.ReplaceAll(strings.TrimSpace(string(out)), "\r\n", "\n"), "\n", 2)

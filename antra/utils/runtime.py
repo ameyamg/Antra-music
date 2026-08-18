@@ -66,6 +66,68 @@ def get_ffprobe_exe() -> Optional[str]:
     return None
 
 
+def _is_ephemeral(path: str) -> bool:
+    """True when `path` lives inside PyInstaller's _MEIPASS extraction dir.
+
+    That directory is deleted the moment this process exits, so a path under it
+    is only valid *while we are running*.  Anything that hands such a path to
+    another process (the Go analyzer does exactly this) receives a dangling
+    path and silently falls back to bare "ffmpeg" on PATH.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return False
+    try:
+        Path(path).resolve().relative_to(Path(meipass).resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _stable_copy(src: Optional[str], dest_dir) -> Optional[str]:
+    """Copy `src` out of the bundle into `dest_dir` and return the new path.
+
+    A path that is already permanent (a system install) is returned unchanged —
+    copying it would waste ~80 MB for nothing.
+    """
+    if not src:
+        return None
+    if not _is_ephemeral(src):
+        return src
+    try:
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / Path(src).name
+        # Idempotent: the source filename carries the ffmpeg version
+        # (ffmpeg-win-x86_64-v7.1.exe), so a version bump lands as a new name
+        # rather than needing an in-place overwrite of a possibly-running exe.
+        if dest.exists() and dest.stat().st_size == Path(src).stat().st_size:
+            return str(dest)
+        tmp = dest.parent / (dest.name + ".tmp")
+        shutil.copy2(src, tmp)
+        if os.name != "nt":
+            os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)
+        return str(dest)
+    except Exception:
+        # Returning the ephemeral path is no worse than returning nothing: the
+        # caller stats it before trusting it.
+        return src
+
+
+def export_runtime_binaries(dest_dir) -> tuple:
+    """Return (ffmpeg, ffprobe) paths that outlive this process.
+
+    Used by the Go desktop shell, which needs a filesystem path it can exec
+    later.  On a machine with a system ffmpeg this is a no-op passthrough; on a
+    clean install it materialises the bundled binary into a persistent dir.
+    """
+    return (
+        _stable_copy(get_ffmpeg_exe(), dest_dir),
+        _stable_copy(get_ffprobe_exe(), dest_dir),
+    )
+
+
 def get_clean_subprocess_env() -> dict:
     """Return os.environ copy with the PyInstaller _MEIPASS dir stripped from
     LD_LIBRARY_PATH (and LD_PRELOAD) on Linux.

@@ -341,13 +341,27 @@ class QobuzAdapter(BaseSourceAdapter):
         return final_path
 
     def _stream_to_file(self, url: str, path: str):
+        # Atomic write (v1.1.8 BUG-4): stream into a .part file and only move it
+        # into place once the transfer completes, so a dropped connection can
+        # never leave a partial, untagged file under the real filename.
         with self._session.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
+            # Same length as the final file — see the note in qobuz_mirror about
+            # Windows MAX_PATH; `path + ".part"` would be 5 chars longer.
+            part_path = os.path.splitext(path)[0] + ".part"
+            try:
+                with open(part_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+                os.replace(part_path, path)
+            except BaseException:
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+                raise
 
 
 def _extract_qobuz_source_metadata(item: dict, album: dict) -> dict:

@@ -40,6 +40,8 @@ except ImportError:
 
 from antra.core.models import TrackMetadata
 
+from antra.utils.longpath import extended_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,12 +61,37 @@ def _sniff_image_mime(data: bytes, response_mime: Optional[str]) -> str:
 class FileTagger:
     _MAX_EMBEDDED_ART_EDGE = 1000
 
-    def __init__(self):
+    def __init__(self, write_antra_tags: bool = True):
         # Cache artwork by URL so albums only hit the CDN once regardless of
         # how many tracks share the same artwork_url.
         self._artwork_cache: dict[str, Optional[tuple[bytes, str, int, int, int]]] = {}
         self._raw_artwork_cache: dict[str, Optional[tuple[bytes, str]]] = {}
         self._sidecar_lock = threading.Lock()
+        # v1.1.8 FEAT-4 — record which Antra version/source produced the file.
+        self.write_antra_tags = write_antra_tags
+
+    @staticmethod
+    def _antra_provenance(track: TrackMetadata) -> list[tuple[str, str]]:
+        """Provenance key/value pairs written into every tagged file (FEAT-4).
+
+        The version comes from `antra.__version__`, the single source of truth,
+        so it cannot drift from the label shown in the UI. `ANTRA_SOURCE` is
+        recorded alongside it because "which version wrote this" and "where did
+        it come from" are the same question when auditing a library for folders
+        that need re-fetching.
+        """
+        from antra import __version__ as _antra_version
+        import datetime as _dt
+
+        pairs = [
+            ("ANTRA_VERSION", str(_antra_version)),
+            ("ANTRA_DOWNLOADED", _dt.datetime.now(_dt.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")),
+        ]
+        source = (getattr(track, "source_service", None) or "").strip()
+        if source:
+            pairs.append(("ANTRA_SOURCE", source))
+        return pairs
 
     def tag(
         self,
@@ -78,6 +105,10 @@ class FileTagger:
             logger.debug(f"[Tagger] Genres missing for {track.title}, querying MusicBrainz...")
             enrich_metadata(track)
 
+        # v1.1.8 BUG-6: use the extended-length form so tagging works on paths
+        # over the Windows 260-char limit instead of failing with [Errno 2]
+        # and leaving an untagged file that later gets duplicated (BUG-3).
+        file_path = extended_path(file_path)
         ext = os.path.splitext(file_path)[1].lower()
         try:
             if ext == ".flac":
@@ -91,6 +122,8 @@ class FileTagger:
                 self._write_lyrics_sidecars(file_path, track)
                 return False
             
+            self._write_antra_provenance(file_path, track)
+
             self.embed_lyrics(
                 file_path,
                 track.lyrics or "",
@@ -134,6 +167,44 @@ class FileTagger:
                 return None
 
     # ── FLAC ──────────────────────────────────────────────────────────────
+
+    def _write_antra_provenance(self, file_path: str, track: TrackMetadata) -> None:
+        """Write ANTRA_VERSION / ANTRA_DOWNLOADED / ANTRA_SOURCE (v1.1.8 FEAT-4).
+
+        Written as a separate pass (the same pattern `embed_lyrics` already uses)
+        so the three per-container tagging methods stay untouched. Failures are
+        swallowed: provenance is a convenience for library auditing and must
+        never be able to fail an otherwise good download.
+        """
+        if not self.write_antra_tags:
+            return
+        pairs = self._antra_provenance(track)
+        ext = os.path.splitext(file_path)[1].lower()
+        try:
+            if ext == ".flac":
+                from mutagen.flac import FLAC
+                audio = FLAC(file_path)
+                for key, value in pairs:
+                    audio[key.lower()] = value
+                audio.save()
+            elif ext == ".mp3":
+                from mutagen.id3 import ID3, TXXX
+                try:
+                    audio = ID3(file_path)
+                except Exception:
+                    audio = ID3()
+                for key, value in pairs:
+                    audio.add(TXXX(encoding=3, desc=key, text=value))
+                audio.save(file_path)
+            elif ext in {".m4a", ".mp4"}:
+                from mutagen.mp4 import MP4
+                audio = MP4(file_path)
+                for key, value in pairs:
+                    # Freeform atoms must be bytes and namespaced.
+                    audio[f"----:com.antra:{key}"] = [value.encode("utf-8")]
+                audio.save()
+        except Exception as e:
+            logger.debug(f"[Tagger] Could not write Antra provenance tags to {file_path}: {e}")
 
     def _tag_flac(self, path: str, track: TrackMetadata):
         audio = FLAC(path)

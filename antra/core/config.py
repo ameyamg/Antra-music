@@ -166,6 +166,16 @@ class Config:
     # Opt-in safety mode for niche catalogs. When enabled, Antra becomes more
     # willing to fail a track than accept a lower-confidence match.
     strict_matching: bool = False
+    # v1.1.8 FEAT-3 — never silently accept a lower-quality substitute. When a
+    # lossless output format is requested and only a lossy file can be delivered,
+    # fail the track into the Failed panel instead of keeping it.
+    strict_format: bool = True
+    # v1.1.8 FEAT-2 — never re-encode one lossy format into another (generation
+    # loss). Same-format lossy output is unaffected (already a stream copy/remux).
+    prevent_lossy_transcode: bool = True
+    # v1.1.8 FEAT-4 — stamp which Antra version/source produced a file so a
+    # library owner can re-fetch folders written by a version with a known bug.
+    write_antra_tags: bool = True
 
     # Library deduplication mode:
     #   "smart_dedup"  — skip a track if the same ISRC/ID exists anywhere in the library (default)
@@ -203,6 +213,12 @@ class Config:
     album_zip_name_template: str = ""
     album_track_filename_template: str = ""
     folder_structure_template: str = ""
+    # v1.1.8 FEAT-11 — user explicitly cleared the folder template: save straight
+    # into the library root with no album folder. Deliberately a separate flag
+    # rather than overloading an empty template, because "" already means "unset,
+    # use the default" for CLI and web callers and flipping that would silently
+    # restructure their libraries.
+    flat_library_root: bool = False
     multi_disc_handling: str = "prefix"
     track_number_padding: int = 2
     illegal_character_replacement: str = ""
@@ -338,6 +354,9 @@ def load_config() -> Config:
         sources_enabled=os.getenv("SOURCES_ENABLED", ""),
         prefer_explicit=os.getenv("PREFER_EXPLICIT", "true").lower() == "true",
         strict_matching=os.getenv("STRICT_MATCHING", "false").lower() == "true",
+        strict_format=os.getenv("STRICT_FORMAT", "true").lower() == "true",
+        prevent_lossy_transcode=os.getenv("PREVENT_LOSSY_TRANSCODE", "true").lower() == "true",
+        write_antra_tags=os.getenv("WRITE_ANTRA_TAGS", "true").lower() == "true",
         library_mode=os.getenv("LIBRARY_MODE", "smart_dedup"),
         folder_structure=os.getenv("FOLDER_STRUCTURE", "standard"),
         album_folder_structure=os.getenv("ALBUM_FOLDER_STRUCTURE", os.getenv("FOLDER_STRUCTURE", "standard")),
@@ -348,6 +367,7 @@ def load_config() -> Config:
         album_zip_name_template=os.getenv("ALBUM_ZIP_NAME_TEMPLATE", ""),
         album_track_filename_template=os.getenv("ALBUM_TRACK_FILENAME_TEMPLATE", ""),
         folder_structure_template=os.getenv("FOLDER_STRUCTURE_TEMPLATE", ""),
+        flat_library_root=os.getenv("FLAT_LIBRARY_ROOT", "false").lower() == "true",
         multi_disc_handling=os.getenv("MULTI_DISC_HANDLING", "prefix"),
         track_number_padding=int(os.getenv("TRACK_NUMBER_PADDING", "2")),
         illegal_character_replacement=os.getenv("ILLEGAL_CHARACTER_REPLACEMENT", ""),

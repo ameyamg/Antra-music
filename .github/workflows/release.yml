@@ -126,10 +126,22 @@ jobs:
           cp "$BIN" AppDir/usr/bin/Antra
 
           # Desktop entry
-          printf '[Desktop Entry]\nName=Antra\nExec=Antra\nIcon=Antra\nType=Application\nCategories=AudioVideo;Audio;\n' > AppDir/Antra.desktop
+          printf '[Desktop Entry]\nName=Antra\nExec=Antra\nIcon=Antra\nType=Application\nCategories=AudioVideo;Audio;\nComment=Lossless music library downloader\n' > AppDir/Antra.desktop
+          # Some launchers / AppImage integrators read the copy under
+          # usr/share/applications rather than the AppDir root.
+          mkdir -p AppDir/usr/share/applications
+          cp AppDir/Antra.desktop AppDir/usr/share/applications/Antra.desktop
 
-          # Icon
-          cp antra-wails/frontend/src/assets/images/logo-universal.png AppDir/Antra.png
+          # Icon. This used to copy frontend/src/assets/images/logo-universal.png,
+          # which is the stock WAILS TEMPLATE LOGO — so every AppImage ever shipped
+          # carried the Wails icon instead of Antra's. Use the real app icon, and
+          # install it at all three paths desktop environments actually look at:
+          # AppDir/<name>.png, .DirIcon (thumbnailers/file managers), and the
+          # hicolor theme path (menus after integration).
+          cp antra-wails/build/linux/appicon.png AppDir/Antra.png
+          cp AppDir/Antra.png AppDir/.DirIcon
+          mkdir -p AppDir/usr/share/icons/hicolor/512x512/apps
+          cp AppDir/Antra.png AppDir/usr/share/icons/hicolor/512x512/apps/Antra.png
 
           # AppRun — lean launcher, relies on system webkit2gtk-4.1
           printf '#!/bin/bash\nexec "$(dirname "$(readlink -f "${0}")")/usr/bin/Antra" "$@"\n' > AppDir/AppRun
@@ -297,7 +309,7 @@ jobs:
             - **Settings Focused** — ⚙️ settings trimmed to API key, failed-track retries, and sources
             - **New Source Adapters** — Deezer, Tidal, and Qobuz mirror adapters; YouTube via yt-dlp
             - **Core Engine Improvements** — resolver, organiser, tagger, and transcoder improvements across the board
-            - **Community** — join us on [Telegram](https://t.me/antraaverse) · support on [Ko-fi](https://ko-fi.com/antraverse)
+            - **Community** — join us on [Telegram](https://t.me/antraaverse) · support on [Patreon](https://patreon.com/AntraVerse)
 
             ## Downloads
 

@@ -96,8 +96,30 @@ class EndpointManifest:
         return []
 
 
+def manifest_fetch_disabled() -> bool:
+    """True when the desktop layer has already supplied the endpoints.
+
+    Set as ANTRA_ENDPOINT_MANIFEST_DISABLED=1 by the Go app (v1.1.8 FEAT-8
+    Phase A) once it has resolved endpoints from the signed-in account. Go holds
+    the device token, so it is the only side that can ask the account — and
+    without this flag the backend would quietly fall back to the PUBLIC GIST,
+    which is the thing being retired.
+
+    Unset means today's behaviour, so nothing changes for anyone not signed in.
+    """
+    return (os.getenv("ANTRA_ENDPOINT_MANIFEST_DISABLED", "") or "").strip().lower() in {"1", "true", "yes"}
+
+
 def load_endpoint_manifest(manifest_url: str | None = None) -> EndpointManifest:
     """Load the endpoint manifest from remote, falling back to the local cache."""
+    if manifest_fetch_disabled():
+        # The endpoints are already in the environment; the cache (written by the
+        # Go layer) fills in anything the env vars do not cover.
+        cached = _read_cache()
+        if cached is not None:
+            return cached
+        return EndpointManifest(hifi=[], amazon=[], apple=[])
+
     manifest_url = (manifest_url or os.getenv("ANTRA_ENDPOINT_MANIFEST_URL") or DEFAULT_ENDPOINT_MANIFEST_URL).strip()
 
     if not manifest_url:

@@ -48,15 +48,46 @@ class ISRCEnricher:
         return r.json().get("accessToken")
 
     def enrich_tracks(self, tracks: list[TrackMetadata], max_workers=2):
-        # Always get a fresh token — never reuse one that may be rate-limited
-        # from a previous call in the same process.
-        self.token = self._get_anonymous_token()
-
         # Build map
         id_to_track = {t.spotify_id: t for t in tracks if t.spotify_id}
         ids = list(id_to_track.keys())
         if not ids:
             return
+
+        # Persistent cache first (v1.1.8 FEAT-6, ported from SpotiFLAC). Every run
+        # previously re-resolved the same ISRCs from scratch — wasted calls and a
+        # real rate-limit exposure, which is exactly what v1.1.3 BUG-12 hit
+        # (Spotify 429 on the first batch, 0/12 enriched). Anything already known
+        # is applied here and dropped from the request set, so a fully-cached
+        # playlist makes no network call at all — not even for a token.
+        self._cache = None
+        try:
+            from antra.core.isrc_cache import get_isrc_cache
+            self._cache = get_isrc_cache()
+        except Exception:
+            self._cache = None
+
+        if self._cache is not None:
+            try:
+                cached = self._cache.get_many(ids)
+            except Exception:
+                cached = {}
+            if cached:
+                for tid, isrc in cached.items():
+                    track = id_to_track.get(tid)
+                    if track is not None and not track.isrc:
+                        track.isrc = isrc
+                ids = [i for i in ids if i not in cached]
+                logger.info(
+                    "[ISRCEnricher] %d ISRCs served from cache, %d left to fetch",
+                    len(cached), len(ids),
+                )
+            if not ids:
+                return
+
+        # Only now is a token needed. Always get a fresh one — never reuse one that
+        # may be rate-limited from a previous call in the same process.
+        self.token = self._get_anonymous_token()
 
         BATCH_SIZE = 50
         batches = [ids[i:i + BATCH_SIZE] for i in range(0, len(ids), BATCH_SIZE)]
@@ -100,6 +131,7 @@ class ISRCEnricher:
 
         def _apply_results(resp_tracks):
             nonlocal enriched_count
+            resolved: dict[str, str] = {}
             for t in resp_tracks:
                 if not t or not t.get("id"):
                     continue
@@ -107,13 +139,25 @@ class ISRCEnricher:
                 if not track_obj:
                     continue
                 isrc = t.get("external_ids", {}).get("isrc")
+                source = "spotify_v1"
                 if not isrc:
                     # Fallback to the partner API using GID
                     isrc = self._fetch_isrc_via_gid(t["id"])
+                    source = "spotify_partner"
 
                 if isrc:
                     track_obj.isrc = isrc
                     enriched_count += 1
+                # Cache negatives too: "this track has no ISRC" is worth
+                # remembering briefly so a playlist does not re-query it every
+                # run. NEGATIVE_TTL_SECONDS keeps that short, since a catalogue
+                # that later gains an ISRC should be picked up again soon.
+                resolved[t["id"]] = isrc or ""
+            if resolved and getattr(self, "_cache", None) is not None:
+                try:
+                    self._cache.put_many(resolved, source="spotify")
+                except Exception:
+                    pass
                 preserve_apple_album_identity = (
                     (getattr(track_obj, "source_service", "") or "").lower() == "apple"
                     and (getattr(track_obj, "request_kind", "") or "").lower() == "album"

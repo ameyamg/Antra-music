@@ -27,7 +27,12 @@ DEFAULT_FILENAME_PREFERENCES: dict[str, Any] = {
     "folder_structure_template": "{album_artist}/{year} - {album}/",
     "multi_disc_handling": "prefix",
     "track_number_padding": 2,
-    "illegal_character_replacement": "",
+    # "_" matches Config.illegal_character_replacement, the desktop app, and what
+    # the web UI has always claimed. This used to default to "" (strip), so new
+    # users silently got stripping while the UI showed underscore. Users who
+    # explicitly chose "" keep it — migrate_legacy_templates honours an empty
+    # string for this one key (see below).
+    "illegal_character_replacement": "_",
     "whitespace_handling": "preserve",
     "filename_conflict_behavior": "skip",
 }

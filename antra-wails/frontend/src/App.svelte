@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, CaptureSpDC } from '../wailsjs/go/main/App.js';
-  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus, GetAlbumAvailability, GetSpotifyLibrary, GetAppleMusicLibrary, RunAutoSync, GetTrackLyrics } from '../wailsjs/go/main/App.js';
+  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus, GetAlbumAvailability, GetSpotifyLibrary, GetAppleMusicLibrary, RunAutoSync, GetTrackLyrics, GetKeyInfo, ValidateKey, StartDeviceLogin, PollDeviceLogin, SignOutDevice, RenewDeviceTokenIfNeeded, GetDeviceAccountStatus } from '../wailsjs/go/main/App.js';
   import { EventsOn, BrowserOpenURL, ClipboardGetText } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
   import AntraLogo from './AntraLogo.svelte';
+  import { playSaved, playFinished, preview as previewSfx, type SfxName } from './lib/sfx';
 
   let config: main.Config = {
     download_path: '',
@@ -50,8 +51,16 @@
     tidal_token_type: 'Bearer',
     tidal_country_code: '',
     antra_api_key: '',
+    antra_device_token: '',
     theme: '',
+    font: '',
+    notify_sound: 'crystal',
+    notify_volume: 70,
+    notify_batch_only: false,
     strict_matching: false,
+    strict_format: true,
+    prevent_lossy_transcode: true,
+    write_antra_tags: true,
     download_source: 'auto',
     download_sources: ['auto'],
     save_cover_art_sidecar: false,
@@ -149,6 +158,55 @@
     SaveConfig(config);
   }
 
+  // ── Typeface (v1.1.8 FEAT-10) ───────────────────────────────────────────────
+  // Both non-system faces are bundled, so every option works offline.
+  const FONTS = [
+    { id: 'antra',      label: 'Antra Mono',   desc: 'The default. Fixed-width, keeps the activity log in neat columns.',   css: "'Fira Code','JetBrains Mono','Consolas',monospace" },
+    { id: 'system',     label: 'System',       desc: 'Follows your OS interface font — Segoe UI on Windows, SF on macOS.',  css: "system-ui,-apple-system,'Segoe UI',Roboto,sans-serif" },
+    { id: 'nunito',     label: 'Nunito',       desc: 'Rounded and soft. Easier for long browsing sessions.',                css: "'Nunito',system-ui,sans-serif" },
+    { id: 'dyslexic',   label: 'OpenDyslexic', desc: 'Weighted letter bottoms to reduce swapping. Applies everywhere, including the log.', css: "'OpenDyslexic','Comic Sans MS',sans-serif" },
+  ];
+  // ── Notification sounds (v1.1.8 FEAT-13) ────────────────────────────────────
+  const SOUNDS = [
+    { id: 'crystal', icon: '✦', label: 'Crystal',  desc: 'FM bell with a soft sub and a short plate tail. The default.' },
+    { id: 'pluck',   icon: '♪', label: 'Pluck',    desc: 'Warm filtered string. Subtle enough for long album runs.' },
+    { id: 'blip',    icon: '•', label: 'Blip',     desc: 'Two quick ticks. Minimal and quiet.' },
+    { id: 'off',     icon: '⏻', label: 'Off',      desc: 'No sound at all.' },
+  ];
+  function chooseSound(id: string) {
+    config.notify_sound = id;
+    config = { ...config };
+    if (id !== 'off') previewSfx(id as SfxName, config.notify_volume ?? 70);
+    SaveConfig(config);
+  }
+  let sfxVolumeSaveTimer: ReturnType<typeof setTimeout>;
+  function onVolumeChange() {
+    // Preview on release so dragging the slider is audible but not a stutter of
+    // overlapping voices, and debounce the disk write.
+    clearTimeout(sfxVolumeSaveTimer);
+    sfxVolumeSaveTimer = setTimeout(() => {
+      if (config.notify_sound && config.notify_sound !== 'off') {
+        previewSfx((config.notify_sound || 'crystal') as SfxName, config.notify_volume ?? 70);
+      }
+      SaveConfig(config);
+    }, 260);
+  }
+
+  // 'antra' writes no attribute at all, so an install that has never touched
+  // this setting renders exactly as it did before the feature existed.
+  function setFontAttr(id: string) {
+    const el = document.documentElement;
+    if (!id || id === 'antra') el.removeAttribute('data-font');
+    else el.setAttribute('data-font', id);
+  }
+  // Separate from setFontAttr so startup can restore the face without writing
+  // config.json back on every launch.
+  function applyFont(id: string) {
+    setFontAttr(id);
+    config.font = id;
+    SaveConfig(config);
+  }
+
   // ── Filename template system ────────────────────────────────────────────────
   const TEMPLATE_DEMO = {
     title: 'Come Together',
@@ -205,6 +263,181 @@
   let setupMode = false;
   let showHistory = false;
   let showSettings = false;
+
+  // ── Supporter key validation (v1.1.8 BUG-5) ───────────────────────────────
+  // keyState: 'idle' | 'validating' | 'valid' | 'invalid' | 'unverified'
+  // 'unverified' means the server could not be reached — deliberately distinct
+  // from 'invalid', because a network failure must never stop a genuinely valid
+  // key from being saved.
+  // Transient inline notice shown under the format selector (e.g. when a locked
+  // supporter-only format is clicked).
+  let settingsNotice = '';
+  let settingsNoticeTimer: any = null;
+  $: if (settingsNotice) {
+    if (settingsNoticeTimer) clearTimeout(settingsNoticeTimer);
+    settingsNoticeTimer = setTimeout(() => { settingsNotice = ''; }, 6000);
+  }
+
+  // ── Device-code account login (v1.1.8 FEAT-8) ─────────────────────────────
+  // The app never handles a password: it shows a short code, opens the browser,
+  // and polls until the user approves on the website.
+  let deviceLoginState: 'idle' | 'starting' | 'waiting' | 'done' | 'error' = 'idle';
+  let deviceUserCode = '';
+  let deviceVerifyUrl = '';
+  let deviceLoginError = '';
+  let deviceLoginUser = '';
+  let devicePollTimer: any = null;
+  let deviceDeadline = 0;
+
+  // The device token lives in its own config field. It used to share
+  // antra_api_key with the pasted supporter key, so signing in overwrote the
+  // key and then failed to validate against /api/keys/validate (a token is not
+  // a keys.json entry) — reported as "Key not recognized" and, worse, silently
+  // dropped the user to free tier. The legacy read is kept so an install that
+  // already signed in still shows as signed in before its first save.
+  $: isSignedIn = (config.antra_device_token || '').trim().startsWith('at_')
+    || (config.antra_api_key || '').trim().startsWith('at_');
+
+  // Account tier comes from the server's own verification of the token
+  // (/api/device/status), never from a local decode of the payload — it is only
+  // base64, so trusting it here would be a free supporter unlock.
+  let accountStatus: any = null;
+
+  async function loadAccountStatus() {
+    if (!isSignedIn) { accountStatus = null; return; }
+    try {
+      accountStatus = await GetDeviceAccountStatus();
+    } catch { accountStatus = null; }
+  }
+
+  function stopDevicePolling() {
+    if (devicePollTimer) { clearInterval(devicePollTimer); devicePollTimer = null; }
+  }
+
+  async function beginDeviceLogin() {
+    deviceLoginState = 'starting';
+    deviceLoginError = '';
+    try {
+      const res: any = await StartDeviceLogin();
+      if (res?.error) { deviceLoginState = 'error'; deviceLoginError = res.error; return; }
+      deviceUserCode = res.user_code || '';
+      deviceVerifyUrl = res.verification_url || '';
+      deviceDeadline = Date.now() + ((res.expires_in || 600) * 1000);
+      deviceLoginState = 'waiting';
+      if (deviceVerifyUrl) BrowserOpenURL(deviceVerifyUrl);
+
+      // Server enforces its own minimum interval and answers 429 -> treated as
+      // still pending, so polling slightly faster than `interval` is harmless.
+      const intervalMs = Math.max(3, res.interval || 3) * 1000;
+      stopDevicePolling();
+      devicePollTimer = setInterval(async () => {
+        if (Date.now() > deviceDeadline) {
+          stopDevicePolling();
+          deviceLoginState = 'error';
+          deviceLoginError = 'The code expired. Please try again.';
+          return;
+        }
+        try {
+          const t: any = await PollDeviceLogin(res.device_code);
+          if (t?.status === 'approved') {
+            stopDevicePolling();
+            deviceLoginUser = t.username || '';
+            deviceLoginState = 'done';
+            // The Go side persisted the token in antra_device_token — the
+            // supporter key field is untouched, so re-read config and refresh
+            // BOTH credentials' status independently.
+            config = await GetConfig();
+            loadAccountStatus();
+            if ((config.antra_api_key || '').trim()) validateSupporterKey(false);
+          } else if (t?.status === 'error') {
+            stopDevicePolling();
+            deviceLoginState = 'error';
+            deviceLoginError = t.error || 'Login failed.';
+          }
+        } catch (e) { /* transient — keep polling until the deadline */ }
+      }, intervalMs);
+    } catch (e) {
+      deviceLoginState = 'error';
+      deviceLoginError = String(e);
+    }
+  }
+
+  async function signOutDevice() {
+    stopDevicePolling();
+    await SignOutDevice();
+    config = await GetConfig();
+    deviceLoginState = 'idle';
+    deviceUserCode = '';
+    deviceLoginUser = '';
+    accountStatus = null;
+    // Signing out must not discard a pasted supporter key — it is a separate
+    // credential — so re-validate it rather than clearing keyState blindly.
+    if ((config.antra_api_key || '').trim()) {
+      validateSupporterKey(false);
+    } else {
+      keyState = 'idle';
+      keyInfo = null;
+    }
+  }
+
+  let keyState: string = 'idle';
+  let keyInfo: any = null;
+  let keyError = '';
+  let keyValidateTimer: any = null;
+  // Supporter status drives the Dolby Atmos gate (FEAT-1). It is only true once
+  // the SERVER has confirmed the credential — never merely because one is
+  // present. EITHER credential can carry the tier: a signed-in account whose
+  // token says supporter, or a validated pasted key. Requiring the key alone is
+  // what made signing in look like a downgrade.
+  $: keyIsSupporter = keyState === 'valid' && !!keyInfo?.is_supporter;
+  $: accountIsSupporter = !!accountStatus?.valid && !!accountStatus?.is_supporter;
+  $: isSupporter = keyIsSupporter || accountIsSupporter;
+
+  function formatKeyExpiry(iso: string): string {
+    try {
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return iso;
+      return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    } catch { return iso; }
+  }
+
+  async function validateSupporterKey(explicit = false) {
+    const key = (config.antra_api_key || '').trim();
+    if (!key) { keyState = 'idle'; keyInfo = null; keyError = ''; return; }
+    if (key.startsWith('at_')) {
+      // A device token from a pre-fix install still sitting in this field.
+      // /api/keys/validate cannot recognise it, so asking would produce the
+      // false "Key not recognized". Account state is reported separately.
+      keyState = 'idle'; keyInfo = null; keyError = '';
+      return;
+    }
+    keyState = 'validating';
+    keyError = '';
+    try {
+      const res: any = await ValidateKey(key);
+      keyInfo = res;
+      if (res?.valid) {
+        keyState = 'valid';
+      } else if (res?.reachable) {
+        keyState = 'invalid';
+        keyError = res?.error || 'Key not recognized';
+      } else {
+        // Could not ask the server — keep the key, flag it as unverified.
+        keyState = 'unverified';
+        keyError = res?.error || '';
+      }
+    } catch (e) {
+      keyState = 'unverified';
+      keyError = String(e);
+    }
+  }
+
+  // Debounced re-validation as the user types/pastes.
+  function scheduleKeyValidation() {
+    if (keyValidateTimer) clearTimeout(keyValidateTimer);
+    keyState = 'idle';
+    keyValidateTimer = setTimeout(() => validateSupporterKey(false), 600);
+  }
   let showFolderSettings = false;
   let folderSettingsSaving = false;
   let settingsScrollTarget: string | null = null; // id of settings section to scroll to on open
@@ -215,6 +448,9 @@
   let inputUrl = '';
   let inputUrlEl: HTMLTextAreaElement | null = null;
   let isDownloading = false;
+  // v1.1.8 FEAT-13 — did this run actually save anything? Gates the batch
+  // flourish so an all-skipped run stays silent.
+  let sfxSawTrack = false;
 
   interface LibraryReleaseSummary {
     kind: string;
@@ -438,46 +674,63 @@
     return ((config.tracked_playlists || []) as any[]).find((p: any) => p.url === url);
   }
 
-  // ── Source health check ─────────────────────────────────────────────────────
-  interface EndpointStatus { url: string; alive: boolean; latency_ms: number; }
-  interface SourceHealth { source: string; total: number; live: number; endpoints: EndpointStatus[]; }
-  let healthCache: Record<string, SourceHealth> = {};
-  let healthPopoverSource = '';
-  let healthLoading = false;
-  let showHealthPopover = false;
+  // ── Mirror status ───────────────────────────────────────────────────────────
+  // One chip, backed by the public status page rather than five client-side
+  // probes. The page is the source of truth, needs no API key, and already
+  // publishes the aggregate verdict — so there is no need to invent an "average"
+  // here: `overall` is computed server-side from the same data the page renders.
+  //   all_operational -> green   (every mirror up)
+  //   degraded        -> amber   (something impaired, nothing down)
+  //   partial_outage  -> red     (at least one mirror down)
+  //   unreachable     -> grey    (we could not check — NOT reported as an outage)
+  const STATUS_PAGE_URL = 'https://status.anandserver.cfd/';
+  const STATUS_JSON_URL = 'https://status.anandserver.cfd/status.json';
 
-  // Gist-sourced source status — fetched once on startup from the public status Gist.
-  // Default: all true (green) so chips don't flash red before the fetch completes.
-  let gistStatus: Record<string, boolean> = { hifi: true, amazon: true, qobuz: true, apple: true, deezer: true };
+  let mirrorStatus: { overall: string; up: number; total: number; avgMs: number; updatedAt: string } | null = null;
+  let mirrorStatusFailed = false;
 
-  async function fetchGistStatus() {
+  async function fetchMirrorStatus() {
     try {
-      const res = await fetch(
-        'https://gist.githubusercontent.com/anandprtp/fdc2c16b7bfdc2d337fbc86161b79371/raw/status.json',
-        { cache: 'no-store' }
-      );
-      if (res.ok) {
-        const data = await res.json();
-        gistStatus = {
-          hifi:   !!(data['hifi']   ?? data['tidal'] ?? true),
-          amazon: !!(data['amazon'] ?? true),
-          qobuz:  !!(data['qobuz']  ?? true),
-          apple:  !!(data['apple']  ?? true),
-          deezer: !!(data['deezer'] ?? true),
-        };
-      }
+      const res = await fetch(STATUS_JSON_URL, { cache: 'no-store' });
+      if (!res.ok) throw new Error(String(res.status));
+      const d = await res.json();
+      const meta = d.meta || {};
+      mirrorStatus = {
+        overall: d.overall || 'unknown',
+        up: Number(meta.operational ?? 0),
+        total: Number(meta.total_services ?? 0),
+        avgMs: Number(meta.avg_latency_ms ?? 0),
+        updatedAt: d.updated_at || '',
+      };
+      mirrorStatusFailed = false;
     } catch {
-      // Fetch failed — keep defaults (all true). Downloads still work; status is unknown.
+      // Never claim an outage we did not observe — "could not check" is its own
+      // state, the same distinction the download validation makes.
+      mirrorStatusFailed = true;
     }
   }
 
-  const healthSources = [
-    { key: 'hifi',   label: 'Tidal',   abbr: 'T', bg: '#1a1a2e', bgEnabled: 'rgba(29,185,222,0.14)',  border: '#1DB9DE', text: '#1DB9DE' },
-    { key: 'apple',  label: 'Apple',   abbr: '',  bg: '#230a10', bgEnabled: 'rgba(252,60,68,0.14)',   border: '#fc3c44', text: '#fc3c44' },
-    { key: 'amazon', label: 'Amazon',  abbr: 'a', bg: '#1a1200', bgEnabled: 'rgba(255,153,0,0.14)',   border: '#FF9900', text: '#FF9900' },
-    { key: 'qobuz',  label: 'Qobuz',   abbr: 'Q', bg: '#0d0d1f', bgEnabled: 'rgba(123,94,167,0.18)',  border: '#7B5EA7', text: '#7B5EA7' },
-    { key: 'deezer', label: 'Deezer',  abbr: 'D', bg: '#001219', bgEnabled: 'rgba(0,196,80,0.14)',    border: '#00C450', text: '#00C450' },
-  ];
+  // Every branch is an EXPLICIT match on a value `status_poller.py` actually
+  // emits. An unrecognised `overall` falls through to unknown/grey rather than
+  // degraded/amber — showing a warning colour for a value we do not understand
+  // would be claiming a problem we never observed.
+  $: mirrorStatusTone =
+    mirrorStatusFailed || !mirrorStatus ? 'is-unknown'
+    : mirrorStatus.overall === 'all_operational' ? 'is-ok'
+    : mirrorStatus.overall === 'partial_outage' ? 'is-down'
+    : mirrorStatus.overall === 'degraded' ? 'is-degraded'
+    : 'is-unknown';
+
+  $: mirrorStatusLabel =
+    mirrorStatusFailed || !mirrorStatus ? 'Status'
+    : `${mirrorStatus.up}/${mirrorStatus.total}`;
+
+  $: mirrorStatusTitle =
+    mirrorStatusFailed || !mirrorStatus
+      ? 'Could not reach the status page — this does not mean the mirrors are down. Click to open it.'
+      : `${mirrorStatus.up} of ${mirrorStatus.total} mirrors operational`
+        + (mirrorStatus.avgMs ? ` · avg ${mirrorStatus.avgMs} ms` : '')
+        + ' — click for the full status page';
   const downloadSourceOptions = [
     { value: 'auto',    label: 'Auto',        icon: null },
     { value: 'tidal',   label: 'Tidal',       icon: '/icons/tidal.webp' },
@@ -550,36 +803,6 @@
     await SaveConfig(config);
   }
 
-  async function checkHealth(src: string, opts: { openPopover?: boolean } = {}) {
-    const { openPopover = true } = opts;
-    healthPopoverSource = src;
-    healthLoading = true;
-    if (openPopover) {
-      showHealthPopover = true;
-    }
-    try {
-      const raw = await CheckSourceHealth(src);
-      healthCache[src] = JSON.parse(raw);
-      healthCache = { ...healthCache };
-    } catch (e) { console.error(e); }
-    finally { healthLoading = false; }
-  }
-
-  // Chip liveness: green when endpoint health cache shows at least one live endpoint.
-  $: chipLive = Object.fromEntries(
-    healthSources.map(s => [s.key, !!(healthCache[s.key] && healthCache[s.key].live > 0)])
-  );
-
-  // Chip enabled: sourced from the public Gist status (fetched on startup).
-  // True = source is online per the Gist; false = source is down or status unknown.
-  $: chipEnabled = Object.fromEntries([
-    ['hifi',   gistStatus['hifi']],
-    ['apple',  gistStatus['apple']],
-    ['amazon', gistStatus['amazon']],
-    ['qobuz',  gistStatus['qobuz']],
-    ['deezer', gistStatus['deezer']],
-  ] as [string, boolean][]);
-
   async function openSettingsAt(sectionId: string) {
     settingsScrollTarget = sectionId;
     showSettings = true;
@@ -589,10 +812,6 @@
       if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
       settingsScrollTarget = null;
     }, 80);
-  }
-
-  function handleChipClick(src: string) {
-    checkHealth(src);
   }
 
   // ── Tracklist scroll state ─────────────────────────────────────────────────
@@ -653,7 +872,7 @@
     enabled: true,
     title: 'Support Antra',
     message: 'Solo-maintained by one developer. Help fund bug fixes, updates, and endpoint costs.',
-    link: 'https://ko-fi.com/antraverse'
+    link: 'https://patreon.com/AntraVerse'
   };
   let supportStatusLoading = false;
 
@@ -837,9 +1056,26 @@
       if (config.strict_matching === undefined || config.strict_matching === null) {
         config.strict_matching = false;
       }
+      // v1.1.8 FEAT-3/2/4 — default ON, so an existing config.json that predates
+      // these keys must be treated as "on", not as unchecked.
+      if (config.strict_format === undefined || config.strict_format === null) {
+        config.strict_format = true;
+      }
+      if (config.prevent_lossy_transcode === undefined || config.prevent_lossy_transcode === null) {
+        config.prevent_lossy_transcode = true;
+      }
+      if (config.write_antra_tags === undefined || config.write_antra_tags === null) {
+        config.write_antra_tags = true;
+      }
       if (!config.download_source) {
         config.download_source = 'auto';
       }
+      // v1.1.8 FEAT-13 — notification sounds. `== null` rather than a falsy
+      // check throughout: volume 0 and notify_sound 'off' are deliberate user
+      // choices and must not be re-defaulted on every launch.
+      if (config.notify_sound == null)      config.notify_sound      = 'crystal';
+      if (config.notify_volume == null)     config.notify_volume     = 70;
+      if (config.notify_batch_only == null) config.notify_batch_only = false;
       selectedDownloadSources = normalizeDownloadSources();
       config = { ...config, download_sources: selectedDownloadSources };
       if (typeof config.save_cover_art_sidecar !== 'boolean') {
@@ -848,12 +1084,16 @@
       // Template defaults
       if (!config.single_track_filename_template) config.single_track_filename_template = '{artist} - {title}';
       if (!config.album_track_filename_template)  config.album_track_filename_template  = '{track} - {title}';
-      if (!config.folder_structure_template)      config.folder_structure_template      = '{album_artist}/{year} - {album}';
+      // v1.1.8 FEAT-11 — `== null` on purpose, NOT a falsy check: an empty
+      // string is a deliberate choice (save into the library root with no album
+      // folder) and must survive a relaunch instead of being re-defaulted.
+      if (config.folder_structure_template == null) config.folder_structure_template = '{album_artist}/{year} - {album}';
       if (!config.illegal_character_replacement)  config.illegal_character_replacement  = '_';
       if (!config.whitespace_handling)            config.whitespace_handling            = 'keep';
       if (!config.track_number_padding)           config.track_number_padding           = 2;
-      // Apply saved theme
+      // Apply saved theme + typeface
       applyTheme(config.theme || 'antra');
+      setFontAttr(config.font || 'antra');
 
       // Auto-sync defaults
       if (config.auto_sync_enabled === undefined) config.auto_sync_enabled = false;
@@ -868,7 +1108,31 @@
     }
 
     await loadSupportStatus();
-    fetchGistStatus(); // non-blocking — chips update when Gist responds
+    fetchMirrorStatus(); // non-blocking — the status chip fills in when it lands
+    // Validate any stored supporter key at startup so supporter-gated features
+    // (Dolby Atmos, FEAT-1) know the real tier rather than assuming from the
+    // mere presence of a key (v1.1.8 BUG-5). Non-blocking.
+    if ((config.antra_api_key || '').trim()) validateSupporterKey(false);
+    // Account tier is a separate question from the pasted key — check both.
+    loadAccountStatus();
+
+    // v1.1.8 FEAT-12 — keep the session alive without the website. Renewal runs
+    // against the mirrors, so it works even while the site is down. Deliberately
+    // fire-and-forget: it must never delay startup, and only a positive server
+    // rejection is worth telling the user about.
+    RenewDeviceTokenIfNeeded().then((r: any) => {
+      if (!r) return;
+      if (r.status === 'renewed' && r.token) {
+        config.antra_device_token = r.token;
+        loadAccountStatus();
+      } else if (r.status === 'reauth') {
+        deviceLoginState = 'error';
+        deviceLoginError = r.error || 'Your session has ended. Please sign in again.';
+      }
+      // 'unavailable' stays silent on purpose — the token still works, and
+      // nagging about a transient outage is exactly the noise to avoid.
+    }).catch(() => {});
+
     if (config.spotify_sp_dc) {
       loadSpotifyLibrary(); // non-blocking — Spotify mixes section updates when ready
     }
@@ -1021,15 +1285,18 @@
       }, 1200);
     }
 
-    // Kick off health checks for all VPS endpoints on startup
-    for (const src of healthSources) {
-      checkHealth(src.key, { openPopover: false }).catch(() => {});
-    }
+    // Refresh the mirror status periodically. The poller behind the page runs on
+    // a 60s cycle and the payload is ~5 KB, so 5 minutes is plenty and costs
+    // nothing; the five per-source probes this replaced hit every endpoint.
+    const statusTimer = setInterval(() => { fetchMirrorStatus(); }, 300000);
 
     const handleWindowResize = () => {
     };
     window.addEventListener('resize', handleWindowResize);
-    return () => window.removeEventListener('resize', handleWindowResize);
+    return () => {
+      clearInterval(statusTimer);
+      window.removeEventListener('resize', handleWindowResize);
+    };
   });
 
   function updateAutoScrollState() {
@@ -1187,6 +1454,12 @@
         if (retryQueue.length > 0) { processRetryQueue(); }
       } else {
         addLog('success', '✔ Library updated successfully');
+        // v1.1.8 FEAT-13 — batch flourish. Only when at least one track was
+        // actually saved, so a fully-skipped ("already in library") run stays
+        // silent rather than congratulating the user for doing nothing.
+        if (config.notify_sound && config.notify_sound !== 'off' && sfxSawTrack) {
+          playFinished(config.notify_volume ?? 70);
+        }
         if (retryQueue.length > 0) { processRetryQueue(); }
       }
       return;
@@ -1305,6 +1578,13 @@
       } else if (name === 'track_completed') {
         addLog('success', `[✓] Added to library: ${trackLabel}`);
         clearTrackInterval(trackKey);
+        // v1.1.8 FEAT-13 — per-track "saved" sound. Suppressed in batch-only
+        // mode; otherwise throttled inside playSaved() so a fast album cannot
+        // machine-gun the speaker.
+        sfxSawTrack = true;
+        if (!config.notify_batch_only) {
+          playSaved((config.notify_sound || 'crystal') as SfxName, config.notify_volume ?? 70);
+        }
         updateActiveTrack(trackKey, {
           mode: 'progress',
           progress: 100,
@@ -1360,6 +1640,11 @@
     probe?: any;
     spectrogram?: string;
     stats?: any;   // AudioStats: peakDb, rmsDb, truePeakDb, lufsI, lufsLRA, cutoffHz
+    // v1.1.8 FEAT-5 — SpectralAnalysis: verdict, cutoffConfidence, shelfDropDb,
+    // evidence[], avgSpectrumDb[]. Carries its own justification so the UI can
+    // show why it reached a conclusion instead of asserting one.
+    spectral?: any;
+    spectralError?: string;
     error?: string;
   }
 
@@ -1372,6 +1657,11 @@
   let discoveryGenre = '';
   let discoveryData: any = null;
   let discoveryLoading = false;
+  // Which service supplies Discover. Spotify uses the personalised home feed,
+  // so it needs a connected account; the backend falls back to Apple on its
+  // own and reports which source it actually used.
+  let discoverySource: 'apple' | 'spotify' = 'apple';
+  let discoveryActualSource: string = 'apple';
   let discoveryGenres: any[] = [];
   let discoveryGenresLoading = false;
 
@@ -1379,7 +1669,7 @@
     discoveryGenresLoading = true;
     try {
       // @ts-ignore
-      const raw = await window.go.main.App.GetDiscoveryGenres(discoveryRegion);
+      const raw = await window.go.main.App.GetDiscoveryGenres(discoveryRegion, discoverySource);
       const parsed = JSON.parse(raw);
       if (parsed.type === 'discovery_genres') {
         discoveryGenres = parsed.data || [];
@@ -1396,10 +1686,14 @@
     discoveryLoading = true;
     try {
       // @ts-ignore
-      const raw = await window.go.main.App.GetDiscoveryData(discoveryRegion, discoveryGenre, discoveryGenres.find(g => g.id === discoveryGenre)?.name || '');
+      const raw = await window.go.main.App.GetDiscoveryData(discoveryRegion, discoveryGenre, discoveryGenres.find(g => g.id === discoveryGenre)?.name || '', discoverySource);
       const parsed = JSON.parse(raw);
       if (parsed.type === 'discovery') {
         discoveryData = parsed.data;
+        discoveryActualSource = parsed.source || 'apple';
+        if (discoverySource === 'spotify' && discoveryActualSource !== 'spotify') {
+          addLog('warn', 'Spotify Discover unavailable — showing Apple Music charts. Connect your Spotify account in Settings.');
+        }
       } else {
         addLog('error', `Failed to load discovery: ${parsed.error || parsed.message}`);
       }
@@ -1518,7 +1812,14 @@
   let showAnalyzer = false;
   let analyzerTracks: TrackAnalysis[] = [];
   let analyzerCurrentIndex = 0;
-  let analyzerViewMode: ViewMode = 'gallery';
+  // Single is the DEFAULT and the only view that carries the metadata grid,
+  // audio stats, spectral verdict and the interactive spectrogram. Gallery is a
+  // contact sheet — it shows a thumbnail and a badge and nothing else — so it is
+  // only ever chosen automatically for 3+ files. Defaulting to gallery made
+  // analysing one file strictly worse than v1.1.7: every panel was hidden, and
+  // with a single track the Gallery/Single toggle is not even rendered, so there
+  // was no way back.
+  let analyzerViewMode: ViewMode = 'single';
   let analyzerDragOver = false;
   let analyzerProcessing = false;
   let analyzerExportStatus = '';
@@ -1526,16 +1827,11 @@
   $: analyzerDoneCount = analyzerTracks.filter(t => t.status === 'done').length;
   $: analyzerShowSidebar = analyzerTracks.length > 1;
   $: analyzerShowExportAll = analyzerTracks.length >= 2;
-  $: {
-    if (analyzerTracks.length >= 3 && analyzerViewMode !== 'gallery') {
-      // default to gallery for 3+ tracks — only auto-set once on first load
-    }
-  }
 
   function analyzerReset() {
     analyzerTracks = [];
     analyzerCurrentIndex = 0;
-    analyzerViewMode = 'gallery';
+    analyzerViewMode = 'single';
     analyzerExportStatus = '';
   }
 
@@ -1544,7 +1840,7 @@
     if (analyzerCurrentIndex >= analyzerTracks.length) {
       analyzerCurrentIndex = Math.max(0, analyzerTracks.length - 1);
     }
-    if (analyzerTracks.length < 2) analyzerViewMode = 'gallery';
+    if (analyzerTracks.length < 3) analyzerViewMode = 'single';
   }
 
   function analyzerFileName(path: string): string {
@@ -1567,7 +1863,8 @@
       a.fileName.localeCompare(b.fileName)
     );
 
-    if (analyzerTracks.length >= 3) analyzerViewMode = 'gallery';
+    // 3+ files is a contact sheet; 1–2 go straight to the detailed view.
+    analyzerViewMode = analyzerTracks.length >= 3 ? 'gallery' : 'single';
 
     await analyzerProcessQueue();
   }
@@ -1590,6 +1887,8 @@
           probe: result.probe,
           spectrogram: result.spectrogram,
           stats: result.stats,
+          spectral: result.spectral,       // v1.1.8 FEAT-5 — FFT analysis + evidence
+          spectralError: result.spectralError,
           error: result.spectrogramError || result.probeError || undefined,
         };
       } catch (e: any) {
@@ -1690,6 +1989,189 @@
     return rows;
   }
 
+  // ── Interactive spectrogram (v1.1.8 FEAT-5 UI) ─────────────────────────────
+  // Rendered from the byte matrix the Go analyser returns. Keeping the data
+  // client-side means zoom, pan and hover cost no backend round-trip — the one
+  // idea worth taking from SpotiFLAC's approach, without their full-PCM payload.
+  let specCanvas: HTMLCanvasElement | null = null;
+  let specZoom = 1;        // 1 = whole analysed window
+  let specPan = 0;         // 0..1 fraction of the scrollable width
+  let specPalette = 'magma';
+  let specReadout = '';
+  let specDragging = false;
+  let specDragX = 0;
+
+  const SPEC_PALETTES: Record<string, (v: number) => [number, number, number]> = {
+    // Perceptually-ordered ramps: dark = quiet, bright = loud. Magma and
+    // viridis are used because they stay monotonic in luminance, so a louder
+    // band always looks louder — rainbow maps do not, and misread badly.
+    magma: (v) => [
+      Math.min(255, Math.round(255 * Math.pow(v, 0.75))),
+      Math.round(200 * Math.pow(Math.max(0, v - 0.25) / 0.75, 1.6)),
+      Math.round(180 * Math.pow(Math.max(0, v - 0.55) / 0.45, 1.2) + 40 * v),
+    ],
+    viridis: (v) => [
+      Math.round(70 * (1 - v) + 253 * Math.pow(v, 2.2)),
+      Math.round(20 + 210 * Math.pow(v, 0.85)),
+      Math.round(90 + 120 * (1 - Math.pow(v, 0.6))),
+    ],
+    grey: (v) => {
+      const g = Math.round(255 * Math.pow(v, 0.8));
+      return [g, g, g];
+    },
+  };
+
+  // Go's encoding/json marshals a []byte as a BASE64 STRING, so SpectralAnalysis's
+  // `Columns [][]byte` arrives here as string[], not number[][]. The first cut of
+  // this code indexed those strings directly, so every cell read a character
+  // instead of a byte, every value came out NaN, and the canvas painted solid
+  // black. The Go test asserted on the Go struct and never crossed the JSON
+  // bridge, which is exactly why it passed. Decode explicitly, once per analysis.
+  const specColumnCache = new WeakMap<object, Uint8Array[]>();
+  function specColumns(spec: any): Uint8Array[] {
+    if (!spec || !spec.columns?.length) return [];
+    const cached = specColumnCache.get(spec);
+    if (cached) return cached;
+    const out: Uint8Array[] = spec.columns.map((c: any) => {
+      if (typeof c !== 'string') return Uint8Array.from(c || []);
+      const bin = atob(c);
+      const arr = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      return arr;
+    });
+    specColumnCache.set(spec, out);
+    return out;
+  }
+
+  function drawSpectrogram(track: any) {
+    // Alias to a plain local BEFORE mutating anything on it. `specCanvas` is a
+    // component-level reactive variable, so Svelte compiles `specCanvas.width =
+    // …` into `$$invalidate(specCanvas, …)`. That marks the component dirty,
+    // which re-runs the reactive block below (it depends on specCanvas), which
+    // calls this function again, which invalidates again — an unbounded loop of
+    // full-canvas repaints that permanently wedges the UI thread and forces the
+    // user to kill the app. Mutating a local does not invalidate anything.
+    const cv = specCanvas;
+    if (!cv) return;
+    const spec = track?.spectral;
+    const cols = specColumns(spec);
+    if (!cols.length) return;
+    const rows = cols[0]?.length || 0;
+    if (!rows) return;
+
+    const cssW = cv.clientWidth || 640;
+    const cssH = 220;
+    // Cap DPR: a full-width spectrogram at 3x on a hi-dpi screen is a lot of
+    // pixels for no visible benefit.
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.round(cssW * dpr);
+    const h = Math.round(cssH * dpr);
+    if (w <= 0 || h <= 0) return;
+    cv.width = w;
+    cv.height = h;
+    cv.style.height = cssH + 'px';
+
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    const img = ctx.createImageData(w, h);
+    const pal = SPEC_PALETTES[specPalette] || SPEC_PALETTES.magma;
+
+    const visible = cols.length / specZoom;
+    const startCol = Math.max(0, Math.min(cols.length - visible, specPan * (cols.length - visible)));
+
+    for (let px = 0; px < w; px++) {
+      const c = Math.min(cols.length - 1, Math.floor(startCol + (px / w) * visible));
+      const col = cols[c];
+      for (let py = 0; py < h; py++) {
+        // Low frequencies at the bottom, as every spectrogram convention expects.
+        const r = Math.min(rows - 1, Math.floor((1 - py / h) * rows));
+        const v = (col[r] || 0) / 255;
+        const [rr, gg, bb] = pal(v);
+        const o = (py * w + px) * 4;
+        img.data[o] = rr; img.data[o + 1] = gg; img.data[o + 2] = bb; img.data[o + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  function specGeometry(track: any) {
+    const spec = track?.spectral;
+    const cols = specColumns(spec);
+    const visible = cols.length / specZoom;
+    const startCol = Math.max(0, Math.min(cols.length - visible, specPan * (cols.length - visible)));
+    return { spec, cols, visible, startCol };
+  }
+
+  function onSpecHover(e: MouseEvent, track: any) {
+    if (!specCanvas) return;
+    const { spec, cols, visible, startCol } = specGeometry(track);
+    if (!spec || !cols.length) return;
+    const rect = specCanvas.getBoundingClientRect();
+    const fx = (e.clientX - rect.left) / rect.width;
+    const fy = 1 - (e.clientY - rect.top) / rect.height;
+    const c = Math.max(0, Math.min(cols.length - 1, Math.floor(startCol + fx * visible)));
+    const rows = cols[0].length;
+    const r = Math.max(0, Math.min(rows - 1, Math.floor(fy * rows)));
+    const totalSec = (spec.timeEndSec ?? 0) - (spec.timeStartSec ?? 0);
+    const t = (spec.timeStartSec ?? 0) + (c / cols.length) * totalSec;
+    const hz = r * (spec.freqBinHz ?? 0);
+    const db = spec.specFloorDb + ((cols[c][r] || 0) / 255) * (0 - spec.specFloorDb);
+    specReadout = `${t.toFixed(1)}s · ${(hz / 1000).toFixed(2)} kHz · ${db.toFixed(0)} dB`;
+  }
+
+  // A full repaint is a per-pixel loop over the whole canvas (~800k iterations at
+  // 2x DPR). Calling it straight from mousemove queues repaints faster than they
+  // can run and locks the UI thread solid, so coalesce to one repaint per frame.
+  let specRafPending = false;
+  function scheduleSpecDraw(track: any) {
+    if (specRafPending) return;
+    specRafPending = true;
+    requestAnimationFrame(() => {
+      specRafPending = false;
+      drawSpectrogram(track);
+    });
+  }
+
+  function onSpecZoom(e: WheelEvent, track: any) {
+    const prev = specZoom;
+    specZoom = Math.max(1, Math.min(16, specZoom * (e.deltaY < 0 ? 1.25 : 0.8)));
+    if (specZoom !== prev) scheduleSpecDraw(track);
+  }
+
+  function onSpecDragStart(e: MouseEvent) { specDragging = true; specDragX = e.clientX; }
+  // Bound on window, not just the canvas: releasing the button anywhere else —
+  // which is the normal way a drag ends — otherwise left specDragging stuck true
+  // forever, and every subsequent mouse move over the canvas repainted it.
+  function onSpecDragEnd() { specDragging = false; }
+  function onSpecDrag(e: MouseEvent, track: any) {
+    if (!specDragging || !specCanvas) return;
+    const dx = e.clientX - specDragX;
+    specDragX = e.clientX;
+    specPan = Math.max(0, Math.min(1, specPan - dx / specCanvas.clientWidth / specZoom));
+    scheduleSpecDraw(track);
+  }
+
+  async function exportSpectrogramPng(track: any) {
+    if (!specCanvas) return;
+    try {
+      const data = specCanvas.toDataURL('image/png').split(',')[1];
+      const name = (track.fileName || 'spectrogram').replace(/\.[^.]+$/, '') + '-spectrogram.png';
+      await WriteFile(name, data);
+      specReadout = `saved ${name}`;
+    } catch (e) {
+      specReadout = 'PNG export failed';
+    }
+  }
+
+  // Redraw whenever the canvas mounts, the viewed track changes, or the palette
+  // changes. The canvas is only bound once Svelte has rendered it, so this
+  // reactive statement is what actually paints the first frame.
+  $: if (specCanvas && analyzerTracks[analyzerCurrentIndex]?.spectral) {
+    // reference specPalette/specZoom so the statement re-runs on their change
+    specPalette; specZoom;
+    tick().then(() => drawSpectrogram(analyzerTracks[analyzerCurrentIndex]));
+  }
+
   function analyzerQualityBadge(track: TrackAnalysis): { label: string; color: string } {
     if (!track.probe) return { label: '—', color: '#555' };
     const streams = track.probe.streams || [];
@@ -1701,9 +2183,33 @@
     const br = +(fmt.bit_rate || 0);
     const cutoff = track.stats?.cutoffHz ?? 0;
 
+    const spectral: any = (track as any).spectral;
+
     if (codec === 'flac' || codec === 'alac') {
-      // Frequency cutoff below 14 kHz = almost certainly a lossy-to-lossless transcode
-      if (cutoff > 0 && cutoff < 14000) return { label: 'Fake Lossless', color: '#f87171' };
+      // v1.1.8 FEAT-5: only assert "Fake Lossless" on real FFT evidence — a
+      // sharp low-pass shelf well below Nyquist, found with high confidence.
+      // The old rule was `cutoff < 14000` from a six-point probe that could only
+      // return {8k,12k,16k,17k,19k,21k}, so it both missed most transcodes and
+      // libelled genuine masters with little treble. Wrongly branding a real
+      // master is the worse error, so uncertainty now reads as "Inconclusive".
+      if (spectral) {
+        if (spectral.verdict === 'lossy' && spectral.cutoffConfidence >= 0.75) {
+          return { label: 'Fake Lossless', color: '#f87171' };
+        }
+        if (spectral.verdict === 'inconclusive' && spectral.cutoffConfidence < 0.55) {
+          return { label: 'Lossless (unverified)', color: '#facc15' };
+        }
+        if (spectral.verdict === 'lossless') {
+          // Real spectral evidence beats the bitrate heuristics below, which are
+          // crude enough to libel a genuine quiet or mono master as fake.
+          return (bits >= 24 && sr >= 88200)
+            ? { label: 'Hi-Res Lossless', color: '#a78bfa' }
+            : { label: 'Lossless', color: '#00ffcc' };
+        }
+      } else if (cutoff > 0 && cutoff < 14000) {
+        // Legacy coarse probe only — flag as suspect, never assert.
+        return { label: 'Suspect (low cutoff)', color: '#facc15' };
+      }
       if (bits >= 24 && sr >= 88200) {
         if (br > 0 && br < 400000) return { label: 'Suspect (Low Bitrate)', color: '#f87171' };
         return { label: 'Hi-Res Lossless', color: '#a78bfa' };
@@ -2000,8 +2506,32 @@
     setupMode = false;
   }
 
+  // ── Sign-in gate (v1.1.8 FEAT-8 Phase B) ──────────────────────────────────
+  // From this release the shared key published in the gist manifest is retired,
+  // so a download needs a credential of the user's own: an Antra account, or a
+  // supporter key (those are NOT affected by the sunset and keep working).
+  //
+  // Deliberately permissive: this checks that a credential EXISTS, not that the
+  // server has blessed it, and an unreachable server never blocks anyone. The
+  // real enforcement is server-side — the mirrors refuse the retired key
+  // themselves. This gate is guidance so users get a clear prompt instead of a
+  // wall of per-track auth failures; making it strict would only add a way to
+  // lock out someone whose credential is fine while they are briefly offline.
+  $: hasOwnCredential = isSignedIn
+    || ((config.antra_api_key || '').trim() !== '' && !(config.antra_api_key || '').trim().startsWith('at_'));
+
+  function promptSignIn() {
+    // Reuse the existing opener so the panel actually scrolls to the account
+    // section rather than dumping the user at the top of Settings.
+    openSettingsAt('access-key-section');
+  }
+
   async function startDownload() {
     if (!inputUrl) return;
+    if (!hasOwnCredential) {
+      promptSignIn();
+      return;
+    }
 
     // Accept one URL per line, or comma-separated, or both
     let urls = inputUrl
@@ -2021,6 +2551,7 @@
 
     if (otherUrls.length > 0) {
       isDownloading = true;
+    sfxSawTrack = false;
       logs = [];
       trackOrder = [];
       trackLabels = {};
@@ -2102,6 +2633,13 @@
         showArtistSearch = false;
       } else {
         artistSearchResults = Array.isArray(parsed) ? parsed : [];
+        // Spotify's public search is rate-limited on some networks and the
+        // backend falls back to Apple. Say so rather than presenting Apple
+        // results under a "Spotify" label.
+        if (searchSource === 'spotify' && artistSearchResults.length
+            && artistSearchResults[0]?.source && artistSearchResults[0].source !== 'spotify') {
+          addLog('warn', 'Spotify artist search was unavailable — showing Apple Music results instead.');
+        }
       }
     } catch (e) {
       if (reqId === artistSearchReqId) {
@@ -2329,6 +2867,7 @@
 
     clearTrackInterval(trackName);
     isDownloading = true;
+    sfxSawTrack = false;
     addLog('info', `[↻] Retrying failed track: ${trackName}`);
     updateActiveTrack(trackName, {
       mode: 'status',
@@ -2403,7 +2942,40 @@
           <button on:click={pickDir}>Browse</button>
         </div>
       </div>
+      <!-- v1.1.8 FEAT-8 Phase B — account step at first run. Deliberately not a
+           hard wall: a supporter with a key does not need an account, and
+           someone who skips it is prompted again on the main screen rather than
+           being stuck on setup with no way forward. -->
+      <div class="field" style="margin-top: 18px;">
+        <label>Antra Account</label>
+        <p style="font-size: 11px; color: #555; margin: 0 0 10px; line-height: 1.5;">
+          Downloads go through your own Antra account. Your password is never entered into this
+          app — the browser handles sign-in and this device gets its own revocable token.
+        </p>
+        {#if isSignedIn}
+          <p style="font-size: 12px; color: #86efac; margin: 0;">
+            ✓ Signed in{accountStatus?.username ? ` as ${accountStatus.username}` : ''}
+          </p>
+        {:else if deviceLoginState === 'waiting'}
+          <p style="font-size: 11px; color: #666; margin: 0 0 8px;">Enter this code in your browser:</p>
+          <p style="font-family: monospace; font-size: 20px; letter-spacing: 3px; color: var(--accent-color); margin: 0 0 6px;">{deviceUserCode}</p>
+          <p style="font-size: 11px; color: #888; margin: 0;">Waiting for approval…</p>
+        {:else}
+          <button on:click={beginDeviceLogin} disabled={deviceLoginState === 'starting'} style="width: 100%;">
+            {deviceLoginState === 'starting' ? 'Opening browser…' : 'Log in with Antra'}
+          </button>
+          {#if deviceLoginError}
+            <p style="font-size: 11px; color: #fca5a5; margin: 8px 0 0;">{deviceLoginError}</p>
+          {/if}
+        {/if}
+      </div>
+
       <button style="margin-top: 24px; width: 100%;" on:click={saveSetup}>Build My Library →</button>
+      {#if !hasOwnCredential}
+        <p style="font-size: 10.5px; color: #555; text-align: center; margin: 10px 0 0;">
+          You can sign in later from Settings — downloads need an account or a supporter key.
+        </p>
+      {/if}
     </div>
   </main>
 {:else}
@@ -2426,9 +2998,10 @@
           <button bind:this={settingsButtonEl} on:click={openSettings} title="Settings" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">⚙️</button>
           <div style="width: 1px; height: 20px; background: rgba(255,255,255,0.1); margin: 0 2px;"></div>
           <div class="kofi-wrap">
-            <button on:click={() => kofiTooltipVisible = !kofiTooltipVisible} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
+            <button title="Support Antra on Patreon" on:click={() => kofiTooltipVisible = !kofiTooltipVisible} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/>
+                <circle cx="15.1" cy="10.3" r="6.4" fill="#FF424D"/>
+                <rect x="2.6" y="3.3" width="4" height="17.4" fill="#ffffff"/>
               </svg>
             </button>
             {#if kofiTooltipVisible && supportStatus.enabled}
@@ -2442,8 +3015,8 @@
                   <p class="kofi-tooltip-refreshing">Refreshing…</p>
                 {/if}
                 <button class="kofi-tooltip-btn" on:click={() => BrowserOpenURL(supportStatus.link)}>
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/></svg>
-                  Support on Ko-fi
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="15.1" cy="10.3" r="6.4" fill="#FF424D"/><rect x="2.6" y="3.3" width="4" height="17.4" fill="#ffffff"/></svg>
+                  Support on Patreon
                 </button>
               </div>
             {/if}
@@ -2454,7 +3027,7 @@
               <path d="M17.93 6.56L5.54 11.17c-.83.33-.82.8-.15 1l3.17.99 7.34-4.63c.35-.21.66-.1.4.14L9.4 14.1l-.22 3.37c.32 0 .46-.15.63-.3l1.52-1.48 3.16 2.33c.58.32 1 .16 1.14-.54l2.07-9.73c.2-.8-.3-1.16-.77-.95z" fill="white"/>
             </svg>
           </button>
-          <button title="Join our Discord community" on:click={() => BrowserOpenURL('https://discord.gg/Gq7CBAme7')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
+          <button title="Join our Discord community" on:click={() => BrowserOpenURL('https://discord.com/invite/UcY5cqMuE')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
               <circle cx="12" cy="12" r="12" fill="#5865F2"/>
               <path d="M8.12 7.75c1.02-.45 2.08-.7 3.14-.76l.15.29c-1.19.17-1.74.5-1.74.5s.15-.08.4-.18c.73-.31 1.31-.39 1.55-.41.04 0 .07-.01.11-.01.41-.05.88-.06 1.37-.01.64.07 1.33.26 2.03.61 0 0-.52-.31-1.65-.49l.21-.32c1.06.06 2.12.31 3.14.76 0 0 1.68 2.42 1.68 5.39 0 0-.98 1.67-3.55 1.76 0 0-.42-.5-.77-.93 1.54-.46 2.12-1.42 2.12-1.42-.48.32-.94.55-1.35.71-.58.24-1.14.39-1.69.47-1.12.2-2.15.14-3.03-.01-.67-.13-1.25-.31-1.73-.52-.27-.11-.57-.25-.87-.43-.04-.02-.08-.04-.12-.07-.02-.01-.03-.02-.05-.03-.22-.12-.34-.21-.34-.21s.56.93 2.06 1.4c-.35.44-.78.97-.78.97-2.57-.09-3.54-1.76-3.54-1.76 0-2.97 1.67-5.39 1.67-5.39Zm2.25 4.56c.66 0 1.19-.58 1.19-1.29 0-.71-.52-1.29-1.19-1.29-.66 0-1.19.58-1.19 1.29 0 .71.53 1.29 1.19 1.29Zm4.26 0c.66 0 1.19-.58 1.19-1.29 0-.71-.52-1.29-1.19-1.29-.66 0-1.19.58-1.19 1.29 0 .71.53 1.29 1.19 1.29Z" fill="white"/>
@@ -2497,12 +3070,35 @@
             on:keydown={(e) => e.key === 'Enter' && startArtistSearch()}
             style="flex: 1; min-width: 0; font-family: inherit; font-size: 13px; height: 38px;"
           />
+          <select bind:value={searchSource} class="discover-select"
+                  style="height: 38px; width: auto; flex: 0 0 auto; min-width: 148px;"
+                  title="Which catalogue to search">
+            <option value="apple">Apple Music</option>
+            <option value="spotify" disabled={!config.spotify_sp_dc}>Spotify{config.spotify_sp_dc ? '' : ' (connect account)'}</option>
+          </select>
           <button on:click={startArtistSearch} disabled={!searchQuery.trim() || artistSearchLoading} style="height: 38px; white-space: nowrap;">
             {artistSearchLoading ? 'Searching...' : 'Search'}
           </button>
         </div>
       {:else if activeTab === 'discover'}
       {:else}
+        <!-- v1.1.8 FEAT-8 Phase B — shown BEFORE the user pastes anything, so
+             they are never surprised by a refusal after queueing an album. -->
+        {#if !hasOwnCredential}
+          <div class="signin-banner">
+            <div style="flex: 1; min-width: 0;">
+              <p style="margin: 0 0 4px; font-size: 12.5px; font-weight: 600; color: var(--accent-color);">Sign in to start downloading</p>
+              <p style="margin: 0; font-size: 11px; color: #888; line-height: 1.5;">
+                Antra now downloads through your own Antra account. It takes about 20 seconds —
+                your password is never entered into this app, the browser handles it.
+                Already a supporter? Pasting your supporter key works too.
+              </p>
+            </div>
+            <button on:click={promptSignIn} style="flex-shrink: 0; background: var(--accent-color); color: #000; font-weight: 600; font-size: 12px; padding: 8px 16px;">
+              Log in with Antra
+            </button>
+          </div>
+        {/if}
         <!-- URL input -->
         <div class="input-bar" style="display: flex; gap: 8px; align-items: flex-start;">
           <textarea
@@ -2525,36 +3121,21 @@
         </div>
       {/if}
 
-      <!-- Source health chips + format selector -->
+      <!-- Single mirror-status chip + format selector.
+           Replaces the five per-source chips: the public status page is now the
+           source of truth, it carries far more detail than a colour could, and
+           five chips meant five startup probes plus the endpoint list living in
+           the client. `flex-shrink: 0` matters — the chips used to be squeezed
+           whenever the format selector grew (e.g. the Atmos note). -->
       <div class="source-health-bar">
-        {#each healthSources as src}
-          {@const live  = !!chipLive[src.key]}
-          {@const isOn  = !!(chipEnabled[src.key])}
-          {@const checked = src.key in healthCache}
-          <button
-            class="health-chip"
-            class:health-chip-disabled={!isOn}
-            class:health-chip-enabled={isOn}
-            on:click={() => handleChipClick(src.key)}
-            title={isOn
-              ? src.key === 'apple'
-                ? `Apple — AAC / MP3 only (online)`
-                : `${src.label} — online`
-              : `${src.label} — currently unavailable`}
-          >
-            {#if src.key === 'hifi'}
-              <img src="/icons/tidal-health.png" alt="Tidal" class="health-chip-icon" />
-            {:else if src.key === 'apple'}
-              <img src="/icons/apple-health.png" alt="Apple Music" class="health-chip-icon" />
-            {:else if src.key === 'amazon'}
-              <img src="/icons/amazon-health.png" alt="Amazon Music" class="health-chip-icon" />
-            {:else if src.key === 'qobuz'}
-              <img src="/icons/qobuz-health.png" alt="Qobuz" class="health-chip-icon" />
-            {:else if src.key === 'deezer'}
-              <img src="/icons/deezer-health.png" alt="Deezer" class="health-chip-icon" />
-            {/if}
-          </button>
-        {/each}
+        <button
+          class="mirror-status-chip {mirrorStatusTone}"
+          on:click={() => BrowserOpenURL(STATUS_PAGE_URL)}
+          title={mirrorStatusTitle}
+        >
+          <span class="mirror-status-dot"></span>
+          <span class="mirror-status-label">{mirrorStatusLabel}</span>
+        </button>
         <div class="format-selector">
           <div class="format-main-row">
             {#each formatOptions as fmt}
@@ -2565,6 +3146,20 @@
                 on:click={() => setParentFormat(fmt.value)}
               >{fmt.name}</button>
             {/each}
+            <!-- Dolby Atmos (v1.1.8 FEAT-1) — supporter-gated. isSupporter is
+                 only true once the SERVER has confirmed the key (BUG-5), never
+                 merely because a key string is present. -->
+            <button
+              class="format-pill format-pill--atmos"
+              class:active={_fmtBase === 'atmos'}
+              class:locked={!isSupporter}
+              title={isSupporter
+                ? 'Dolby Atmos — spatial mix from Tidal, Apple Music or Amazon Music, chosen by the link you paste'
+                : 'Dolby Atmos is a supporter feature. Add a valid supporter key in Settings to unlock it.'}
+              on:click={() => isSupporter
+                ? setParentFormat('atmos')
+                : (settingsNotice = 'Dolby Atmos requires a supporter key. Add yours in Settings → Supporter Key.')}
+            >{isSupporter ? 'Atmos' : '🔒 Atmos'}</button>
           </div>
           {#if showBitDepthRow}
             <div class="format-sub-row">
@@ -2584,6 +3179,19 @@
           {/if}
         </div>
       </div>
+      <!-- Notices live OUTSIDE the flex row on purpose. While they sat inside it,
+           selecting Atmos grew the format selector and visibly squeezed the
+           status chips next to it — the layout jumped on every format change. -->
+      {#if settingsNotice}
+        <p class="format-notice">{settingsNotice}</p>
+      {/if}
+      {#if _fmtBase === 'atmos'}
+        <p class="format-note">
+          The Atmos mix is sourced from <strong>Tidal</strong>, <strong>Apple Music</strong> or
+          <strong>Amazon Music</strong> — whichever service you paste a link from. Tracks with
+          no Atmos mix will fail rather than silently download in stereo.
+        </p>
+      {/if}
     </div>
 
     <!-- Playlist header: cover art + rich metadata, shown once playlist_loaded fires -->
@@ -3087,6 +3695,12 @@
     <div class="discover-topbar">
       <div class="discover-topbar-left">
         <span class="discover-topbar-title">🌟 Discover</span>
+        <select bind:value={discoverySource}
+                on:change={() => { loadDiscoveryGenres(); loadDiscoveryData(); }}
+                class="discover-select" title="Where Discover content comes from">
+          <option value="apple">Apple Music</option>
+          <option value="spotify" disabled={!config.spotify_sp_dc}>Spotify{config.spotify_sp_dc ? '' : ' (connect account)'}</option>
+        </select>
         <select bind:value={discoveryRegion} on:change={() => { loadDiscoveryGenres(); loadDiscoveryData(); }} class="discover-select">
           <option value="in">India (IN)</option>
           <option value="us">United States (US)</option>
@@ -3123,12 +3737,14 @@
           <option value="hk">Hong Kong (HK)</option>
           <option value="tw">Taiwan (TW)</option>
         </select>
-        <select bind:value={discoveryGenre} on:change={loadDiscoveryData} class="discover-select discover-select-genre">
-          <option value="">Top Charts (All Genres)</option>
-          {#each discoveryGenres as genre}
-            <option value={genre.id}>{genre.name}</option>
-          {/each}
-        </select>
+        {#if discoveryGenres.length}
+          <select bind:value={discoveryGenre} on:change={loadDiscoveryData} class="discover-select discover-select-genre">
+            <option value="">Top Charts (All Genres)</option>
+            {#each discoveryGenres as genre}
+              <option value={genre.id}>{genre.name}</option>
+            {/each}
+          </select>
+        {/if}
         <button on:click={loadDiscoveryData} disabled={discoveryLoading} class="discover-refresh-btn">
           {discoveryLoading ? '↻' : '↻ Refresh'}
         </button>
@@ -3244,13 +3860,13 @@
     on:mouseleave={() => { sponsorToastTimer = setTimeout(() => dismissSponsorToast(), 3000); }}
   >
     <div class="sponsor-toast-icon">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/></svg>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><circle cx="15.1" cy="10.3" r="6.4" fill="#FF424D"/><rect x="2.6" y="3.3" width="4" height="17.4" fill="#ffffff"/></svg>
     </div>
     <div class="sponsor-toast-body">
       <p class="sponsor-toast-title">{supportStatus.title}</p>
       <p class="sponsor-toast-text">{supportStatus.message}</p>
       <button class="sponsor-toast-btn" on:click={() => { BrowserOpenURL(supportStatus.link); dismissSponsorToast(); }}>
-        Support on Ko-fi
+        Support on Patreon
       </button>
     </div>
     <button class="sponsor-toast-close" on:click={dismissSponsorToast} title="Dismiss">×</button>
@@ -3381,6 +3997,79 @@
       <button on:click={() => showThemes = false} style="padding: 6px 14px; font-size: 13px; flex-shrink: 0;">Close</button>
     </div>
     <div class="themes-body">
+      <!-- Typeface (v1.1.8 FEAT-10) -->
+      <div class="themes-section">
+        <div class="themes-section-head">
+          <span class="themes-section-label">TYPEFACE</span>
+          <span class="themes-section-sub">Applies across the whole app</span>
+        </div>
+        <div class="font-grid">
+          {#each FONTS as f}
+            <button
+              class="font-card{(config.font || 'antra') === f.id ? ' font-card--active' : ''}"
+              on:click={() => applyFont(f.id)}
+            >
+              <!-- Each card previews in its own face, so the choice is visible
+                   before it is applied. -->
+              <span class="font-card-sample" style="font-family:{f.css};">Aa</span>
+              <span class="font-card-body">
+                <span class="font-card-name" style="font-family:{f.css};">{f.label}</span>
+                <span class="font-card-desc">{f.desc}</span>
+              </span>
+              {#if (config.font || 'antra') === f.id}<span class="font-card-badge">ACTIVE</span>{/if}
+            </button>
+          {/each}
+        </div>
+      </div>
+
+      <!-- Notification sound (v1.1.8 FEAT-13) -->
+      <div class="themes-section">
+        <div class="themes-section-head">
+          <span class="themes-section-label">NOTIFICATION SOUND</span>
+          <span class="themes-section-sub">Plays when a track is saved · click a card to hear it</span>
+        </div>
+        <div class="font-grid">
+          {#each SOUNDS as s}
+            <button
+              class="font-card{(config.notify_sound || 'crystal') === s.id ? ' font-card--active' : ''}"
+              on:click={() => chooseSound(s.id)}
+            >
+              <span class="font-card-sample sfx-glyph">{s.icon}</span>
+              <span class="font-card-body">
+                <span class="font-card-name">{s.label}</span>
+                <span class="font-card-desc">{s.desc}</span>
+              </span>
+              {#if (config.notify_sound || 'crystal') === s.id}<span class="font-card-badge">ACTIVE</span>{/if}
+            </button>
+          {/each}
+        </div>
+
+        {#if (config.notify_sound || 'crystal') !== 'off'}
+          <div class="sfx-controls">
+            <label class="sfx-vol">
+              <span class="sfx-vol-label">Volume</span>
+              <input
+                type="range" min="0" max="100" step="5"
+                bind:value={config.notify_volume}
+                on:input={onVolumeChange}
+              />
+              <span class="sfx-vol-num">{config.notify_volume ?? 70}%</span>
+            </label>
+            <label class="sfx-check">
+              <input
+                type="checkbox"
+                bind:checked={config.notify_batch_only}
+                on:change={() => SaveConfig(config)}
+              />
+              <span>
+                Only when the whole download finishes
+                <small>Silences the per-track sound — useful for large albums. The finish flourish still plays.</small>
+              </span>
+            </label>
+          </div>
+        {/if}
+      </div>
+
       <div class="themes-section">
         <div class="themes-section-head">
           <span class="themes-section-label">ANTRA ORIGINALS</span>
@@ -3723,37 +4412,120 @@
       <!-- ── Antra Access Key ──────────────────────────────────────────────── -->
       <div id="access-key-section" class="field" style="display:flex; flex-direction:column; gap:12px; padding:0; background:none; border:none;">
 
-        <!-- Ko-fi promo box -->
-        {#if !config.antra_api_key}
+        <!-- Patreon promo box — hidden for anyone who already has supporter
+             tier by EITHER route, not merely anyone with a key in the box. -->
+        {#if !isSupporter}
         <div style="background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 14px 16px;">
           <p style="font-size: 13px; font-weight: 700; margin: 0 0 6px; color: var(--accent-color);">🎁 Want the full experience?</p>
           <p style="font-size: 11.5px; color: var(--text-secondary); margin: 0 0 12px; line-height: 1.5;">
-            Need <strong>unlimited downloads</strong>, <strong>2× faster speed</strong>, and <strong>concurrent downloads</strong>? Support on Ko-fi to get a 30-day key with no limits, then message me on Telegram or Ko-fi and I’ll send your key over.
+            Need <strong>unlimited downloads</strong>, <strong>2× faster speed</strong>, and <strong>concurrent downloads</strong>? Support on Patreon to get a supporter key with no limits — it’s emailed to you automatically after your payment.
           </p>
           <button
-            on:click={() => BrowserOpenURL('https://ko-fi.com/antraverse')}
+            on:click={() => BrowserOpenURL('https://patreon.com/AntraVerse')}
             style="font-size: 12px; padding: 7px 14px; background: var(--accent-color); color: #000; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;"
-          >☕ Support on Ko-fi →</button>
+          >♥ Support on Patreon →</button>
         </div>
         {/if}
 
         <!-- Key input -->
+        <!-- v1.1.8 FEAT-8 — account login. The app never sees a password: it
+             shows a short code and the browser does the actual sign-in. -->
+        <div style="background: rgba(0,255,204,0.03); border: 1px solid rgba(0,255,204,0.12); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px;">
+          <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px; color: var(--accent-color);">👤 Antra Account</p>
+          {#if isSignedIn}
+            <p style="font-size: 11px; color: #86efac; margin: 0 0 4px;">
+              ✓ Signed in{(accountStatus?.username || deviceLoginUser) ? ` as ${accountStatus?.username || deviceLoginUser}` : ''}{accountIsSupporter ? ' — supporter' : ''}
+            </p>
+            <!-- Tier is reported from the server's verification of the token.
+                 "Could not check" is deliberately distinct from "free": an
+                 outage must never look like a downgrade, and it must never
+                 discard a separately-valid supporter key. -->
+            {#if accountStatus && accountStatus.reachable && !accountStatus.valid}
+              <p style="font-size: 11px; color: #fca5a5; margin: 0 0 10px;">
+                ✗ This session has ended — sign in again.
+              </p>
+            {:else if accountStatus && !accountStatus.reachable}
+              <p style="font-size: 11px; color: #fcd34d; margin: 0 0 10px;">
+                ⚠ Could not check your account tier right now{keyIsSupporter ? ' — your supporter key is active, so supporter features stay on.' : '.'}
+              </p>
+            {:else if accountStatus?.valid && !accountIsSupporter}
+              <p style="font-size: 11px; color: #888; margin: 0 0 10px;">
+                Free tier{keyIsSupporter ? ' — supporter features come from your key below.' : '. Claim your supporter key on the website to link it to this account.'}
+              </p>
+            {/if}
+            <button on:click={signOutDevice} style="font-size: 11px; padding: 6px 12px;">Sign out</button>
+          {:else if deviceLoginState === 'waiting'}
+            <p style="font-size: 11px; color: #666; margin: 0 0 8px; line-height: 1.45;">
+              Your browser has been opened. Sign in, then enter this code:
+            </p>
+            <p style="font-family: monospace; font-size: 22px; letter-spacing: 3px; color: var(--accent-color); margin: 0 0 8px;">{deviceUserCode}</p>
+            <p style="font-size: 11px; color: #888; margin: 0 0 8px;">Waiting for approval…</p>
+            <button on:click={() => { stopDevicePolling(); deviceLoginState = 'idle'; }} style="font-size: 11px; padding: 6px 12px;">Cancel</button>
+          {:else}
+            <p style="font-size: 11px; color: #666; margin: 0 0 12px; line-height: 1.45;">
+              Sign in with your Antra website account. Your password is never entered into
+              this app — the browser handles it, and this device gets its own revocable token.
+            </p>
+            <button
+              on:click={beginDeviceLogin}
+              disabled={deviceLoginState === 'starting'}
+              style="font-size: 12px; padding: 8px 16px; background: var(--accent-color); color: #000; font-weight: 600;"
+            >{deviceLoginState === 'starting' ? 'Opening browser…' : 'Log in with Antra'}</button>
+            {#if deviceLoginState === 'error'}
+              <p style="font-size: 11px; color: #fca5a5; margin: 8px 0 0;">{deviceLoginError}</p>
+            {/if}
+          {/if}
+        </div>
+
         <div style="background: rgba(0,255,204,0.03); border: 1px solid rgba(0,255,204,0.12); border-radius: 10px; padding: 14px 16px;">
           <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px; color: var(--accent-color);">🔑 Supporter Key</p>
           <p style="font-size: 11px; color: #666; margin: 0 0 12px; line-height: 1.45;">
-            Already a supporter? Message me on Ko-fi or Telegram after supporting to receive your key. Paste it below.
+            {#if accountIsSupporter}
+              Your account already carries supporter tier, so you don’t need a key here. Pasting one is harmless.
+            {:else}
+              Already a supporter? Your key is emailed to you automatically after your Patreon payment — paste it below. Message me on Telegram or Discord if it hasn’t arrived.
+            {/if}
           </p>
           <div style="display: flex; gap: 8px; align-items: center;">
             <input
               type="password"
               bind:value={config.antra_api_key}
+              on:input={scheduleKeyValidation}
               placeholder="Paste your supporter key here…"
               style="flex: 1; box-sizing: border-box; font-family: monospace; font-size: 12px;"
             />
-            {#if config.antra_api_key}
-              <span style="font-size: 11px; color: #86efac; white-space: nowrap; flex-shrink: 0;">✓ Supporter</span>
-            {/if}
+            <button
+              on:click={() => validateSupporterKey(true)}
+              disabled={keyState === 'validating' || !config.antra_api_key}
+              style="flex-shrink: 0; font-size: 11px; padding: 6px 12px;"
+            >{keyState === 'validating' ? 'Checking…' : 'Verify'}</button>
           </div>
+          <!-- v1.1.8 BUG-5: the key is validated against the server. The old UI
+               showed "✓ Supporter" for ANY non-empty string, so a typo looked
+               like success. Note "could not reach the server" is deliberately
+               NOT treated as an invalid key — a genuinely valid key must still
+               be saveable while offline. -->
+          {#if keyState === 'validating'}
+            <p style="font-size: 11px; color: #888; margin: 8px 0 0;">Validating key…</p>
+          {:else if keyState === 'valid'}
+            <p style="font-size: 11px; color: #86efac; margin: 8px 0 0;">
+              ✓ {keyInfo?.key_type === 'premium' ? 'Premium' : 'Supporter'} key active{keyInfo?.expires_at ? ` — expires ${formatKeyExpiry(keyInfo.expires_at)}` : ' — no expiry'}
+              {#if keyInfo && keyInfo.download_limit}
+                <br />Downloads: {keyInfo.download_count ?? 0} / {keyInfo.download_limit}
+              {:else if keyInfo?.is_supporter}
+                <br />Unlimited downloads
+              {/if}
+            </p>
+          {:else if keyState === 'invalid'}
+            <p style="font-size: 11px; color: #fca5a5; margin: 8px 0 0;">
+              ✗ {keyError || 'Key not recognized'} — this key will not unlock supporter features.
+            </p>
+          {:else if keyState === 'unverified'}
+            <p style="font-size: 11px; color: #fcd34d; margin: 8px 0 0;">
+              ⚠ Could not reach the Antra servers, so this key could not be verified. It has been
+              saved — it will be checked again next time you are online.
+            </p>
+          {/if}
         </div>
       </div>
 
@@ -3772,6 +4544,36 @@
             <div>
               <span style="font-weight: 500; font-size: 13px;">Strict matching mode</span>
               <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Opt-in safety mode for niche music. Antra uses stricter duration and confidence checks, and will fail uncertain tracks instead of downloading risky matches.</p>
+            </div>
+          </label>
+        </div>
+
+        <div style="margin-top: 14px;">
+          <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
+            <input type="checkbox" bind:checked={config.strict_format} style="margin-top: 2px;" />
+            <div>
+              <span style="font-weight: 500; font-size: 13px;">Strict format — never accept a lower-quality substitute</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">When you ask for a lossless format and only a lossy copy is available, fail the track instead of silently saving an MP3/AAC. Failed tracks appear in the Failed panel with a retry button and the reason.</p>
+            </div>
+          </label>
+        </div>
+
+        <div style="margin-top: 14px;">
+          <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
+            <input type="checkbox" bind:checked={config.prevent_lossy_transcode} style="margin-top: 2px;" />
+            <div>
+              <span style="font-weight: 500; font-size: 13px;">Never re-encode lossy audio</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Converting one lossy format into another (e.g. AAC → MP3) loses quality twice. With this on, Antra keeps the original lossy file rather than re-encoding it. Lossless → MP3/AAC is unaffected, and so is same-format output.</p>
+            </div>
+          </label>
+        </div>
+
+        <div style="margin-top: 14px;">
+          <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
+            <input type="checkbox" bind:checked={config.write_antra_tags} style="margin-top: 2px;" />
+            <div>
+              <span style="font-weight: 500; font-size: 13px;">Record Antra version in downloaded files</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Writes ANTRA_VERSION, ANTRA_SOURCE and ANTRA_DOWNLOADED tags so you can find and re-fetch folders written by an older version. Invisible in normal players.</p>
             </div>
           </label>
         </div>
@@ -4039,7 +4841,7 @@
     </div>
 
     <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px; display:flex; flex-direction:column; gap:8px; align-items:center;">
-      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.7</p>
+      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.8</p>
     </div>
   </div>
 </div>
@@ -4133,12 +4935,14 @@
             id="folderTplInput"
             type="text"
             bind:value={config.folder_structure_template}
-            placeholder={'{album_artist}/{year} - {album}'}
+            placeholder="Leave empty to save straight into the library folder"
             style="width:100%; box-sizing:border-box; font-family:monospace; font-size:12px;"
             on:focus={(e) => focusedTemplateEl = e.currentTarget}
           />
           {#if config.folder_structure_template}
             <p class="tpl-preview">Preview: {renderPreview(config.folder_structure_template)}/</p>
+          {:else}
+            <p class="tpl-preview">No album folder &mdash; tracks are saved directly in your library folder. Good for loose singles.</p>
           {/if}
         </div>
       </div>
@@ -4343,6 +5147,7 @@
           const albumUrls = [...discographySelected];
           showDiscography = false;
           isDownloading = true;
+    sfxSawTrack = false;
           logs = [];
           trackOrder = [];
           trackLabels = {};
@@ -4378,65 +5183,9 @@
 {/if}
 
 <!-- ── Source Health Popover ────────────────────────────────────────────────── -->
-{#if showHealthPopover}
-  {@const activeSrc = healthSources.find(s => s.key === healthPopoverSource)}
-<div class="modal-overlay" on:click={() => showHealthPopover = false}>
-  <div class="modal-content" on:click|stopPropagation style="max-width: 320px;">
-    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.07); padding-bottom:14px; margin-bottom:16px;">
-      <div style="display:flex; align-items:center; gap:10px;">
-        {#if healthPopoverSource === 'hifi'}
-          <img src="/icons/tidal.webp" alt="Tidal" style="width:26px; height:26px; object-fit:contain;" />
-        {:else if healthPopoverSource === 'apple'}
-          <img src="/icons/apple-music.png" alt="Apple Music" style="width:26px; height:26px; object-fit:contain;" />
-        {:else if healthPopoverSource === 'amazon'}
-          <img src="/icons/amazon-music.jpg" alt="Amazon Music" style="width:26px; height:26px; object-fit:contain; border-radius:4px;" />
-        {:else if healthPopoverSource === 'qobuz'}
-          <img src="/icons/qobuz.png" alt="Qobuz" style="width:26px; height:26px; object-fit:contain;" />
-        {:else if healthPopoverSource === 'deezer'}
-          <img src="/icons/deezer.webp" alt="Deezer" style="width:26px; height:26px; object-fit:contain;" />
-        {/if}
-        <div style="display:flex; flex-direction:column; gap:2px;">
-          <span style="font-size:14px; font-weight:600; color:{activeSrc?.text ?? '#e2e8f0'};">{activeSrc?.label ?? ''}</span>
-          {#if healthPopoverSource === 'apple'}
-            <span style="font-size:11px; color:#6b7280;">AAC / MP3 only</span>
-          {/if}
-        </div>
-      </div>
-      <button on:click={() => showHealthPopover = false} style="padding:4px 8px; font-size:12px;">✕</button>
-    </div>
-
-    {#if healthLoading}
-      <div style="text-align:center; padding:28px 0; color:#555; font-size:13px;">Checking endpoints...</div>
-    {:else}
-      {@const result = healthCache[healthPopoverSource]}
-      {#if result}
-        <!-- Summary -->
-        <div style="display:flex; align-items:baseline; gap:6px; margin-bottom:18px;">
-          <span style="font-size:32px; font-weight:700; line-height:1; color:{result.live > 0 ? (activeSrc?.text ?? '#4ade80') : '#f87171'};">{result.live}</span>
-          <span style="font-size:13px; color:#555;">of {result.total} servers reachable</span>
-        </div>
-        <!-- Dot grid — no URLs, just alive/down dots with latency on hover -->
-        <div class="health-dot-grid">
-          {#each result.endpoints as ep}
-            <span
-              class="health-status-dot"
-              class:dot-alive={ep.alive}
-              class:dot-dead={!ep.alive}
-              title={ep.alive ? `${ep.latency_ms}ms` : 'unreachable'}
-            ></span>
-          {/each}
-        </div>
-        <p style="font-size:10px; color:#333; margin:12px 0 0; text-align:center;">Hover dots for latency</p>
-      {:else}
-        <div style="text-align:center; padding:24px 0; color:#555; font-size:13px;">No data yet — click to check.</div>
-      {/if}
-    {/if}
-  </div>
-</div>
-{/if}
 
 <!-- ── Audio Quality Analyzer ──────────────────────────────────────────────── -->
-<svelte:window on:keydown={analyzerHandleKey} />
+<svelte:window on:keydown={analyzerHandleKey} on:mouseup={onSpecDragEnd} />
 
 {#if showAnalyzer}
 <div class="modal-overlay" on:click={() => { analyzerReset(); showAnalyzer = false; }}>
@@ -4569,6 +5318,85 @@
                       <span class="az-stat-value">{row.value}</span>
                     {/each}
                   </div>
+                </div>
+              {/if}
+              <!-- v1.1.8 FEAT-5: show the working. A verdict without its evidence
+                   is exactly what made the old analyzer untrustworthy. -->
+              {#if track.spectral}
+                <div class="az-stats-panel">
+                  <div class="az-stats-title">🔬 Spectral Analysis</div>
+                  <div class="az-stats-grid">
+                    <span class="az-stat-label">Verdict</span>
+                    <span class="az-stat-value" style="color:{track.spectral.verdict === 'lossless' ? '#86efac' : track.spectral.verdict === 'lossy' ? '#f87171' : '#facc15'};">
+                      {track.spectral.verdict === 'lossless' ? 'Consistent with lossless'
+                        : track.spectral.verdict === 'lossy' ? `Lossy${track.spectral.likelySource ? ' — ' + track.spectral.likelySource : ''}`
+                        : 'Inconclusive'}
+                    </span>
+                    <span class="az-stat-label">Confidence</span>
+                    <span class="az-stat-value">{Math.round((track.spectral.cutoffConfidence || 0) * 100)}%</span>
+                    <!-- "Content to" rather than "Cutoff": this is the highest
+                         frequency still carrying energy — the point where a Spek
+                         plot goes black — not a filter corner. -->
+                    <span class="az-stat-label">Content to</span>
+                    <span class="az-stat-value">{(track.spectral.cutoffHz / 1000).toFixed(2)} kHz</span>
+                    <span class="az-stat-label">Nyquist</span>
+                    <span class="az-stat-value">{(track.spectral.nyquistHz / 1000).toFixed(1)} kHz</span>
+                    <span class="az-stat-label">Steepest roll-off</span>
+                    <span class="az-stat-value">
+                      {(track.spectral.shelfDropDb || 0).toFixed(1)} dB/kHz{track.spectral.cliffHz ? ` at ${(track.spectral.cliffHz / 1000).toFixed(2)} kHz` : ''}
+                    </span>
+                    <!-- The decisive number: a codec zeroes the bins above its
+                         wall, so they collapse to the numerical floor. A steep
+                         but natural mastering roll-off leaves noise behind. -->
+                    <span class="az-stat-label">Level above</span>
+                    <span class="az-stat-value">{(track.spectral.energyAboveCutoffDb ?? 0).toFixed(0)} dB</span>
+                  </div>
+                  {#if track.spectral.evidence?.length}
+                    <ul style="margin: 10px 0 0; padding-left: 16px; font-size: 11px; color: #888; line-height: 1.6;">
+                      {#each track.spectral.evidence as line}<li>{line}</li>{/each}
+                    </ul>
+                  {/if}
+
+                  <!-- Interactive spectrogram (v1.1.8 FEAT-5 UI). Rendered from
+                       the byte-quantised time x frequency matrix the Go side
+                       produces, so zoom/pan/hover need no backend round-trip. -->
+                  {#if track.spectral.columns?.length}
+                    <div class="az-spec-wrap">
+                      <div class="az-spec-toolbar">
+                        <span class="az-spec-hint">drag to pan · wheel to zoom · hover to read</span>
+                        <span class="az-spec-readout">{specReadout}</span>
+                        <select bind:value={specPalette} on:change={() => drawSpectrogram(track)}>
+                          <option value="magma">Magma</option>
+                          <option value="viridis">Viridis</option>
+                          <option value="grey">Greyscale</option>
+                        </select>
+                        <button on:click={() => { specZoom = 1; specPan = 0; drawSpectrogram(track); }}>Reset</button>
+                        <button on:click={() => exportSpectrogramPng(track)}>PNG</button>
+                      </div>
+                      <canvas
+                        class="az-spec-canvas"
+                        bind:this={specCanvas}
+                        on:mousemove={(e) => onSpecHover(e, track)}
+                        on:mouseleave={() => (specReadout = '')}
+                        on:wheel|preventDefault={(e) => onSpecZoom(e, track)}
+                        on:mousedown={onSpecDragStart}
+                        on:mousemove={(e) => onSpecDrag(e, track)}
+                        on:mouseup={onSpecDragEnd}
+                      ></canvas>
+                      <div class="az-spec-axis">
+                        <span>{track.spectral.timeStartSec?.toFixed(0)}s</span>
+                        <span>frequency ↑ 0 – {(track.spectral.nyquistHz / 1000).toFixed(1)} kHz</span>
+                        <span>{track.spectral.timeEndSec?.toFixed(0)}s</span>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+              {:else if track.spectralError}
+                <div class="az-stats-panel">
+                  <div class="az-stats-title">🔬 Spectral Analysis</div>
+                  <p style="font-size: 11px; color: #888; margin: 6px 0 0;">
+                    Could not run FFT analysis: {track.spectralError}
+                  </p>
                 </div>
               {/if}
             {/if}
@@ -4815,6 +5643,20 @@
     text-overflow: ellipsis;
     text-align: left;
     width: 100%;
+  }
+  /* ── Sign-in prompt (v1.1.8 FEAT-8 Phase B) ─────────────────────────────── */
+  .signin-banner {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin: 0 0 12px;
+    padding: 12px 14px;
+    border: 1px solid rgba(0, 255, 204, 0.22);
+    border-radius: 8px;
+    background: rgba(0, 255, 204, 0.05);
+  }
+  @media (max-width: 620px) {
+    .signin-banner { flex-direction: column; align-items: stretch; }
   }
   /* ── Failed Tracks Panel (ST-4) ──────────────────────────────────────────── */
   .failed-panel {
@@ -5713,7 +6555,10 @@
     display: flex;
     gap: 6px;
     margin-top: 8px;
-    align-items: center;
+    /* flex-start, NOT center: the format selector changes height (the bit-depth
+       sub-row appears for FLAC/ALAC), and centring made the status chip hop
+       vertically on every format change. Pinned to the top it never moves. */
+    align-items: flex-start;
   }
 
   .format-selector {
@@ -5753,98 +6598,93 @@
   .format-pill--sub { font-size: 9px; padding: 2px 6px; opacity: 0.75; }
   .format-pill--sub:hover { opacity: 1; }
   .format-pill--sub.active { opacity: 1; }
+  /* Dolby Atmos pill (v1.1.8 FEAT-1) — gold to read as premium, dimmed + not
+     highlighted while locked so it is clearly unavailable rather than broken. */
+  .format-pill--atmos {
+    border-color: rgba(212, 175, 55, 0.45);
+    color: #d4af37;
+  }
+  .format-pill--atmos.active {
+    background: rgba(212, 175, 55, 0.16);
+    border-color: #d4af37;
+    color: #f5d76e;
+  }
+  .format-pill--atmos.locked {
+    opacity: 0.5;
+    border-color: rgba(255, 255, 255, 0.12);
+    color: #7a7a7a;
+    cursor: not-allowed;
+  }
+  .format-pill--atmos.locked:hover { background: transparent; }
 
-  .health-chip {
+  /* Interactive spectrogram (v1.1.8 FEAT-5 UI) */
+  .az-spec-wrap { margin-top: 12px; }
+  .az-spec-toolbar {
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 6px; font-size: 11px; color: #888;
+  }
+  .az-spec-hint { opacity: 0.6; }
+  .az-spec-readout {
+    margin-left: auto; font-family: monospace; color: var(--accent-color, #0fc);
+    min-width: 190px; text-align: right;
+  }
+  .az-spec-toolbar select, .az-spec-toolbar button {
+    font-size: 11px; padding: 3px 8px;
+  }
+  .az-spec-canvas {
+    width: 100%; height: 220px; display: block;
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;
+    background: #000; cursor: crosshair;
+  }
+  .az-spec-axis {
+    display: flex; justify-content: space-between;
+    font-size: 10px; color: #666; margin-top: 4px;
+  }
+
+  /* ── Mirror status chip ───────────────────────────────────────────────────
+     One chip replacing the five per-source ones. flex-shrink:0 is load-bearing:
+     the old chips lived in the same flex row as the format selector and were
+     visibly squeezed whenever it grew (selecting Atmos added a note), so the
+     layout jumped on every format change. */
+  .mirror-status-chip {
     display: inline-flex;
     align-items: center;
-    justify-content: center;
-    padding: 0;
-    width: 36px;
-    height: 36px;
-    border-radius: 9px;
-    border: 1.5px solid rgba(255,255,255,0.1);
-    background: transparent;
-    overflow: hidden;
-    cursor: pointer;
-    transition: box-shadow 0.2s, border-color 0.2s, opacity 0.15s;
-    white-space: nowrap;
-  }
-  .health-chip:hover { filter: brightness(1.15); }
-
-  /* Enabled chip: solid green border + layered glow */
-  .health-chip-enabled {
-    border-color: #22c55e !important;
-    box-shadow:
-      0 0 0 1px rgba(34,197,94,0.5),
-      0 0 10px rgba(34,197,94,0.35),
-      0 0 22px rgba(34,197,94,0.15);
-  }
-  .health-chip-enabled:hover {
-    box-shadow:
-      0 0 0 1px rgba(34,197,94,0.75),
-      0 0 14px rgba(34,197,94,0.5),
-      0 0 28px rgba(34,197,94,0.25);
-    filter: brightness(1.12);
-  }
-
-  /* Disabled chip: dark red outline, dimmed, transparent bg */
-  .health-chip-disabled {
-    opacity: 0.5;
-    border-color: #7a2020 !important;
-    box-shadow: none;
-  }
-  .health-chip-disabled:hover {
-    opacity: 0.85;
-    filter: none;
-    border-color: #e05555 !important;
-    box-shadow: 0 0 0 1px rgba(220,50,50,0.3);
-  }
-
-  /* "on" / "off" status badges above the icon */
-  .health-chip-on-badge {
-    font-size: 8px;
-    font-weight: 800;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: #22c55e;
-    line-height: 1;
-  }
-  .health-chip-off-badge {
-    font-size: 8px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: rgba(255,255,255,0.28);
-    line-height: 1;
-  }
-
-  .health-chip-count { font-weight: 700; font-size: 10px; line-height: 1; }
-  .health-chip-idle { opacity: 0.3; font-size: 10px; line-height: 1; }
-  .health-chip-icon { width: 100%; height: 100%; object-fit: cover; display: block; transition: opacity 0.2s; }
-
-  /* ── Health popover dot grid ─────────────────────────────────────────────── */
-  .health-dot-grid {
-    display: flex;
-    flex-wrap: wrap;
     gap: 6px;
+    flex-shrink: 0;
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    font-family: var(--font-mono);
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: rgba(255,255,255,0.45);
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
   }
-
-  .health-status-dot {
-    width: 10px;
-    height: 10px;
+  .mirror-status-chip:hover { background: rgba(255,255,255,0.07); }
+  .mirror-status-dot {
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
-    cursor: default;
-    transition: transform 0.1s;
+    flex-shrink: 0;
+    background: currentColor;
   }
-  .health-status-dot:hover { transform: scale(1.4); }
-  .dot-alive {
-    background: #4ade80;
-    box-shadow: 0 0 5px #4ade8066;
-  }
-  .dot-dead {
-    background: #3a1a1a;
-    border: 1px solid #553333;
-  }
+  .mirror-status-chip.is-ok       { border-color: rgba(74,222,128,0.5);  color: #4ade80; }
+  .mirror-status-chip.is-ok .mirror-status-dot { box-shadow: 0 0 6px #4ade8080; }
+  .mirror-status-chip.is-degraded { border-color: rgba(251,146,60,0.6);  color: #fb923c; }
+  .mirror-status-chip.is-degraded .mirror-status-dot { box-shadow: 0 0 6px #fb923c80; }
+  .mirror-status-chip.is-down     { border-color: rgba(248,113,113,0.6); color: #f87171; }
+  .mirror-status-chip.is-down .mirror-status-dot { box-shadow: 0 0 6px #f8717180; }
+  /* Unknown is deliberately neutral grey, not red: failing to reach the status
+     page is not evidence that the mirrors are down. */
+  .mirror-status-chip.is-unknown  { border-color: rgba(255,255,255,0.12); color: rgba(255,255,255,0.35); }
+  .mirror-status-label { line-height: 1; }
+
+  /* Format notices sit below the bar, so they can never resize the row. */
+  .format-notice { font-size: 11px; color: #fcd34d; margin: 8px 0 0; }
+  .format-note   { font-size: 11px; color: #888; margin: 8px 0 0; line-height: 1.5; }
 
   /* ── Tracklist wrapper + scroll arrow ────────────────────────────────────── */
   .tracklist-wrapper {
@@ -6734,6 +7574,104 @@
     font-size: 13px;
     color: var(--text-muted);
   }
+  /* ── Notification sound (v1.1.8 FEAT-13) ─────────────────────────────────── */
+  .sfx-glyph {
+    font-size: 22px;
+    line-height: 1;
+    color: var(--accent-color, #00ffcc);
+  }
+  .sfx-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 14px;
+    padding: 12px 14px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+  }
+  .sfx-vol {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .sfx-vol-label {
+    font-size: 12px;
+    color: var(--text-secondary, #999);
+    min-width: 54px;
+  }
+  .sfx-vol input[type="range"] {
+    flex: 1;
+    accent-color: var(--accent-color, #00ffcc);
+    cursor: pointer;
+  }
+  .sfx-vol-num {
+    font-size: 12px;
+    color: var(--accent-color, #00ffcc);
+    min-width: 40px;
+    text-align: right;
+  }
+  .sfx-check {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    cursor: pointer;
+    font-size: 12.5px;
+  }
+  .sfx-check input { margin-top: 2px; accent-color: var(--accent-color, #00ffcc); cursor: pointer; }
+  .sfx-check small {
+    display: block;
+    margin-top: 3px;
+    font-size: 11px;
+    color: var(--text-secondary, #888);
+    line-height: 1.45;
+  }
+
+  /* ── Typeface picker (v1.1.8 FEAT-10) ────────────────────────────────────── */
+  .font-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 10px;
+  }
+  .font-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    position: relative;
+    padding: 12px 14px;
+    text-align: left;
+    background: var(--surface-color);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .font-card:hover { background: var(--surface-light); border-color: var(--border-strong); }
+  .font-card--active { border-color: var(--accent-border); background: var(--surface-accent); }
+  .font-card-sample {
+    flex-shrink: 0;
+    width: 42px;
+    height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    border-radius: 6px;
+    background: var(--surface-light);
+    color: var(--accent-color);
+  }
+  .font-card-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .font-card-name { font-size: 13px; color: var(--text-primary); }
+  .font-card-desc { font-size: 11px; line-height: 1.45; color: var(--text-muted); }
+  .font-card-badge {
+    position: absolute;
+    top: 8px;
+    right: 10px;
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    color: var(--accent-color);
+  }
+
   .themes-body {
     flex: 1;
     overflow-y: auto;

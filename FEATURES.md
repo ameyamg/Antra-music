@@ -5,7 +5,7 @@
 <p align="center">
   <a href="README.md">← Back to README</a> &nbsp;·&nbsp;
   <a href="https://github.com/anandprtp/Antra/releases">Download</a> &nbsp;·&nbsp;
-  <a href="https://ko-fi.com/antraverse">Support Development</a>
+  <a href="https://patreon.com/AntraVerse">Support Development</a>
 </p>
 
 <br/>
@@ -26,7 +26,7 @@ Source chain (per track):
 
 Antra also remembers which sources have been reliable across app restarts (a persistent provider-reliability store) and reorders same-priority sources accordingly — without ever letting a lower-quality source jump ahead of a higher-quality one.
 
-Free tier works out of the box with rate-limited downloads. Support on Ko-fi to receive a 30-day supporter key with unlimited downloads and 2-3 concurrent downloads.
+Free tier works out of the box with rate-limited downloads. Support on Patreon to receive a 30-day supporter key with unlimited downloads and 2-3 concurrent downloads.
 
 ---
 
@@ -368,8 +368,8 @@ CI/CD           →  GitHub Actions, 4-platform matrix build on tag push
   <strong>Antra is free to use, maintained by one person in their spare time.</strong><br/>
   <em>If it saves you money on streaming, consider keeping it alive.</em>
   <br/><br/>
-  <a href="https://ko-fi.com/antraverse">
-    <img src="https://img.shields.io/badge/Support_on_Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white"/>
+  <a href="https://patreon.com/AntraVerse">
+    <img src="https://img.shields.io/badge/Support_on_Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white"/>
   </a>
   &nbsp;
   <a href="https://github.com/anandprtp/Antra">

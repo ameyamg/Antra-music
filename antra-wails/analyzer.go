@@ -180,6 +180,37 @@ func detectFrequencyCutoff(filePath, ffmpegExe string, durationSec float64) int 
 	return cutoff
 }
 
+// extractSampleRate pulls the audio sample rate from a ffprobe result map.
+// Returns 0 when unknown so the caller can apply its own default.
+func extractSampleRate(probe map[string]interface{}) int {
+	if probe == nil {
+		return 0
+	}
+	streams, ok := probe["streams"].([]interface{})
+	if !ok {
+		return 0
+	}
+	for _, s := range streams {
+		sm, ok := s.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if ct, _ := sm["codec_type"].(string); ct != "audio" {
+			continue
+		}
+		switch v := sm["sample_rate"].(type) {
+		case string:
+			var sr int
+			if _, err := fmt.Sscanf(v, "%d", &sr); err == nil {
+				return sr
+			}
+		case float64:
+			return int(v)
+		}
+	}
+	return 0
+}
+
 // extractDuration pulls the audio duration from a ffprobe result map.
 func extractDuration(probe map[string]interface{}) float64 {
 	if probe == nil {
@@ -237,6 +268,8 @@ func (a *App) ScanFolder(folderPath string) []string {
 func (a *App) AnalyzeAudio(filePath string) map[string]interface{} {
 	result := make(map[string]interface{})
 
+	// Blocks only if the startup resolution has not finished yet; otherwise free.
+	a.ensureFfmpegPaths()
 	a.mu.Lock()
 	ffmpegExe := a.ffmpegExe
 	ffprobeExe := a.ffprobeExe
@@ -315,11 +348,23 @@ func (a *App) AnalyzeAudio(filePath string) map[string]interface{} {
 
 	wg.Wait()
 
-	// ── Frequency cutoff detection ─────────────────────────────────────────────
-	// Runs after the probe so we have a duration; uses the same ffmpegExe.
+	// ── Spectral analysis (v1.1.8 FEAT-5) ──────────────────────────────────────
+	// Real FFT pass, replacing the old six-point frequency probe which could only
+	// ever return one of {8k,12k,16k,17k,19k,21k} and carried no confidence.
+	// Runs after the probe so we have duration + sample rate.
 	if stats != nil {
 		durationSec := extractDuration(probe)
-		stats.CutoffHz = detectFrequencyCutoff(filePath, ffmpegExe, durationSec)
+		sampleRate := extractSampleRate(probe)
+		spectral, sErr := analyseSpectrum(filePath, ffmpegExe, sampleRate, durationSec)
+		if sErr != nil {
+			result["spectralError"] = sErr.Error()
+			// Fall back to the legacy coarse probe so the panel is never empty —
+			// but it is clearly labelled low-confidence downstream.
+			stats.CutoffHz = detectFrequencyCutoff(filePath, ffmpegExe, durationSec)
+		} else {
+			stats.CutoffHz = spectral.CutoffHz
+			result["spectral"] = spectral
+		}
 	}
 
 	// ── Build result ───────────────────────────────────────────────────────────
@@ -406,35 +451,52 @@ var lyricsTagKeys = []string{
 // a JSON-encoded TrackLyrics.  Returns {"lines":[],"synced":false} on any error
 // or when no lyrics tag is found so the frontend always gets valid JSON.
 func (a *App) GetTrackLyrics(filePath string) string {
+	a.ensureFfmpegPaths()
 	a.mu.Lock()
 	ffprobeExe := a.ffprobeExe
 	a.mu.Unlock()
 
-	cmd := exec.Command(
-		resolveExe(ffprobeExe, "ffprobe"),
-		"-v", "quiet",
-		"-print_format", "json",
-		"-show_format",
-		filePath,
-	)
-	hideProcess(cmd)
-	out, err := cmd.Output()
-	if err != nil {
-		return `{"lines":[],"synced":false}`
+	// ffprobe is NOT guaranteed to exist: imageio_ffmpeg — the source of our
+	// bundled binary — ships ffmpeg only. So on a machine with no system
+	// ffprobe this call cannot succeed, and before the fallback below the
+	// player simply showed no lyrics with no error anywhere. The backend's
+	// --probe has its own mutagen fallback and reads the same tags.
+	readTags := func() map[string]string {
+		cmd := exec.Command(
+			resolveExe(ffprobeExe, "ffprobe"),
+			"-v", "quiet",
+			"-print_format", "json",
+			"-show_format",
+			filePath,
+		)
+		hideProcess(cmd)
+		out, err := cmd.Output()
+		if err != nil {
+			backend, bErr := ensureBundledBackend()
+			if bErr != nil {
+				return nil
+			}
+			probeCmd := exec.Command(backend, "--probe", filePath)
+			hideProcess(probeCmd)
+			if out, err = probeCmd.Output(); err != nil {
+				return nil
+			}
+		}
+		var probe struct {
+			Format struct {
+				Tags map[string]string `json:"tags"`
+			} `json:"format"`
+		}
+		if err := json.Unmarshal(out, &probe); err != nil {
+			return nil
+		}
+		return probe.Format.Tags
 	}
 
-	var probe struct {
-		Format struct {
-			Tags map[string]string `json:"tags"`
-		} `json:"format"`
-	}
-	if err := json.Unmarshal(out, &probe); err != nil {
-		return `{"lines":[],"synced":false}`
-	}
-
+	tags := readTags()
 	raw := ""
 	for _, k := range lyricsTagKeys {
-		if v, ok := probe.Format.Tags[k]; ok && strings.TrimSpace(v) != "" {
+		if v, ok := tags[k]; ok && strings.TrimSpace(v) != "" {
 			raw = v
 			break
 		}

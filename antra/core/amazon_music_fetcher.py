@@ -86,11 +86,22 @@ class AmazonMusicFetcher:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
         marketplace_id = (qs.get("marketplaceId") or ["ATVPDKIKX0DER"])[0]
+        track_asin = (qs.get("trackAsin") or [None])[0]
 
         if url_type == "tracks":
             return self._fetch_track(domain, asin, marketplace_id)
         elif url_type == "albums":
-            return self._fetch_album(domain, asin, marketplace_id)
+            tracks = self._fetch_album(domain, asin, marketplace_id)
+            # An album link can target a single track via ?trackAsin=… (Amazon's
+            # own "share this song" links do this). Honour it: return just that
+            # track instead of the whole album.
+            if track_asin:
+                only = [t for t in tracks if (t.amazon_asin or "").upper() == track_asin.upper()]
+                if only:
+                    return only
+                logger.debug("[AmazonMusic] trackAsin %s not found in album %s — returning full album",
+                             track_asin, asin)
+            return tracks
         elif url_type in ("playlists", "user-playlists"):
             return self._fetch_playlist(domain, url_type, asin, marketplace_id)
         else:

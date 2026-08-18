@@ -34,7 +34,13 @@ logger = logging.getLogger(__name__)
 SOURCE_PREFERENCE_CHOICES = ("auto", "apple", "hifi", "amazon", "qobuz", "deezer", "soulseek", "youtube", "jiosaavn")
 OUTPUT_FORMAT_CHOICES = ("source", "flac", "alac", "m4a", "aac", "mp3", "lossless-16", "lossless-24", "alac-16", "alac-24")
 SPECIAL_SOURCE_PREFERENCE_CHOICES = ("priority-2", "priority-3", "priority-4")
-SPECIAL_OUTPUT_FORMAT_CHOICES = ("lossless", "atmos-tidal", "atmos-apple", "atmos-amazon")
+# "atmos" is the unified user-facing choice; it is resolved to a concrete
+# atmos-<service> by _detect_atmos_service() from the pasted URL before the
+# engine is built. All four MUST stay listed here — normalize_output_format()
+# silently rewrites anything unlisted to "source", which cost the website an
+# entire debugging session in v1.1.6.
+SPECIAL_OUTPUT_FORMAT_CHOICES = ("lossless", "atmos", "atmos-tidal", "atmos-apple", "atmos-amazon")
+ATMOS_OUTPUT_FORMATS = ("atmos", "atmos-tidal", "atmos-apple", "atmos-amazon")
 LEGACY_SOURCE_PREFERENCE_ALIASES = {
     "tidal": "hifi",
     "anandtidal": "hifi",
@@ -137,6 +143,106 @@ def serialize_source_preferences(value) -> str:
     return ",".join(normalize_source_preferences(value))
 
 
+def detect_atmos_service(url: str) -> Optional[str]:
+    """Map a pasted URL to the service whose Atmos mix should be used (FEAT-1).
+
+    Dolby Atmos exists only on Tidal, Apple Music and Amazon Music, and the mix
+    is service-specific — there is no cross-service resolution for it. Returns
+    None when the link is from anywhere else, so the caller can fail with a clear
+    message instead of silently downloading a stereo copy.
+    """
+    host = (url or "").lower()
+    if "tidal.com" in host:
+        return "tidal"
+    if "music.apple.com" in host or "itunes.apple.com" in host:
+        return "apple"
+    if "music.amazon." in host or "amazon.com" in host:
+        return "amazon"
+    return None
+
+
+def resolve_atmos_output_format(output_format: str, url: str) -> str:
+    """Resolve the unified 'atmos' choice to a concrete atmos-<service> format.
+
+    Raises ValueError when the pasted link is not from an Atmos-capable service,
+    so the track fails with an explanatory message rather than quietly falling
+    back to stereo FLAC.
+    """
+    if (output_format or "").lower() != "atmos":
+        return output_format
+    service = detect_atmos_service(url)
+    if not service:
+        raise ValueError(
+            "Dolby Atmos is only available from Tidal, Apple Music or Amazon Music. "
+            "Paste a link from one of those services to download an Atmos mix."
+        )
+    return f"atmos-{service}"
+
+
+def _resolve_apple_mirrors(cfg, manifest=None) -> list:
+    """Apple mirror pool (v1.1.8 FEAT-9).
+
+    Mirrors normally arrive from the remote endpoint manifest, not from config —
+    `cfg.apple_mirrors` is empty on a default install. Anything that needs the
+    Apple mirror must go through here, or it silently gets an empty list.
+    Mirrors the resolution `build_adapters` already performs.
+    """
+    mirrors = list(getattr(cfg, "apple_mirrors", None) or [])
+    mirror_apple_url = ""
+    if not mirrors:
+        if manifest is None:
+            try:
+                from antra.core.endpoint_manifest import load_endpoint_manifest
+                manifest = load_endpoint_manifest()
+            except Exception:
+                manifest = None
+        if manifest is not None:
+            mirrors = list(getattr(manifest, "apple", []) or [])
+            mirror_apple_url = (getattr(manifest, "mirror_apple", "") or "").strip().rstrip("/")
+    env_apple_mirror = (getattr(cfg, "apple_mirror_url", "") or "").strip().rstrip("/")
+    if env_apple_mirror:
+        mirror_apple_url = env_apple_mirror
+    if mirror_apple_url and mirror_apple_url not in mirrors:
+        mirrors = [mirror_apple_url] + mirrors
+    return mirrors
+
+
+def _validated_supporter_mirror_key() -> str:
+    """A personal key the desktop layer has already validated as a supporter key.
+
+    Set as ANTRA_MIRROR_API_KEY by the Go layer *only* after the server answered
+    `valid && is_supporter`. It is empty for free users, for unrecognised keys,
+    and whenever the validation call could not be made — so an empty value means
+    "behave exactly as before" and nobody whose key was not vouched for is
+    affected.
+
+    It outranks the manifest key because FEAT-7 picks the politeness-delay
+    discount from the key on the incoming request. Authenticating with the shared
+    manifest key (key_type "regular") paces every desktop supporter as a free
+    user, which is what was happening before this existed.
+    """
+    return (os.environ.get("ANTRA_MIRROR_API_KEY") or "").strip()
+
+
+def _resolve_mirror_api_key(cfg) -> str:
+    """Key used to authenticate against the mirror servers.
+
+    Priority: a server-validated supporter key, then the manifest key (which the
+    mirrors were registered with), then the user's personal key as a last resort
+    when no manifest is available. Same rule as build_adapters — kept as a helper
+    so build_engine can reach it too (v1.1.8 FEAT-9, where the lyrics fetcher
+    needs the Apple mirror).
+    """
+    api_key = (getattr(cfg, "antra_api_key", "") or "").strip()
+    try:
+        from antra.core.endpoint_manifest import load_endpoint_manifest
+        manifest = load_endpoint_manifest()
+        manifest_key = (getattr(manifest, "api_key", "") or "").strip() if manifest else ""
+    except Exception:
+        manifest_key = ""
+    return _validated_supporter_mirror_key() or manifest_key or api_key
+
+
 def normalize_output_format(value: Optional[str]) -> str:
     normalized = LEGACY_OUTPUT_FORMAT_ALIASES.get(value or "", value or "")
     if normalized in OUTPUT_FORMAT_CHOICES or normalized in SPECIAL_OUTPUT_FORMAT_CHOICES:
@@ -169,7 +275,18 @@ _GIST_MIRRORS_URL = "https://gist.githubusercontent.com/anandprtp/fdc2c16b7bfdc2
 
 
 def _fetch_gist_apple_mirror(cfg) -> str:
-    """Fetch the Apple mirror URL from mirrors.txt on the Gist."""
+    """Fetch the Apple mirror URL from mirrors.txt on the Gist.
+
+    Skipped entirely once the desktop layer has supplied endpoints from the
+    signed-in account — this was the last remaining path that reached the public
+    gist during a download (v1.1.8 FEAT-8 Phase A).
+    """
+    try:
+        from antra.core.endpoint_manifest import manifest_fetch_disabled
+        if manifest_fetch_disabled():
+            return ""
+    except Exception:
+        pass
     try:
         import requests as _r
         resp = _r.get(_GIST_MIRRORS_URL, timeout=8)
@@ -365,10 +482,13 @@ class AntraService:
         manifest_key = ""
         if manifest is not None:
             manifest_key = (getattr(manifest, "api_key", "") or "").strip()
-        # Mirror adapter auth key — manifest key takes priority because mirror
-        # servers were registered with that key. User's personal key is a fallback
-        # only when no manifest is available (e.g. ANTRA_ENDPOINT_MANIFEST_URL unset).
-        mirror_api_key = manifest_key or api_key
+        # Mirror adapter auth key. A server-validated supporter key wins (so the
+        # request carries the tier FEAT-7 prices off — see
+        # _validated_supporter_mirror_key). Otherwise the manifest key, because
+        # the mirrors were registered with that one. The user's personal key is a
+        # last-resort fallback only when no manifest is available at all (e.g.
+        # ANTRA_ENDPOINT_MANIFEST_URL unset).
+        mirror_api_key = _validated_supporter_mirror_key() or manifest_key or api_key
 
         tidal_mirror_url = _mirror_url("tidal_mirror_url", "mirror_tidal")
         if source_group_enabled("tidal_mirror") and tidal_mirror_url:
@@ -1499,9 +1619,23 @@ class AntraService:
             from antra.core.apple_fetcher import AppleFetcher
             return AppleFetcher().search_artists(query)
 
-        # Spotify — try with credentials first, then anonymous token (handled inside
-        # spotify.search_artists). If that returns nothing (e.g. rate-limited), fall
-        # back to Apple Music / iTunes search so the user gets results. Apple Music
+        # Spotify — the partner GraphQL API first. `api.spotify.com` returns 429
+        # on throttled networks for both anonymous and user tokens, so the public
+        # search below silently falls through to Apple and the user gets Apple
+        # artists, Apple discographies and Apple album URLs under a "Spotify"
+        # label. The partner API is the same route the web player uses and works
+        # where the public one does not.
+        sp_dc = (getattr(self._base_config, "spotify_sp_dc", "") or "").strip()
+        if sp_dc:
+            try:
+                from antra.core.spotify_partner import SpotifyPartnerClient
+                results = SpotifyPartnerClient(sp_dc).search_artists(query)
+                if results:
+                    return results
+            except Exception as e:
+                logger.debug(f"[Service] Spotify partner artist search failed ({e})")
+
+        # Public API path, then Apple Music / iTunes as a last resort. Apple Music
         # profile URLs are handled correctly by the discography flow.
         try:
             spotify = self._make_spotify_client(self._base_config)
@@ -1860,9 +1994,14 @@ class AntraService:
         # Atmos formats route to a specific platform via the resolver's
         # _build_resolve_order() — skip source_preference filtering so the
         # resolver gets the full adapter list to pick from.
-        _atmos_formats = {"atmos-tidal", "atmos-apple", "atmos-amazon"}
+        _atmos_formats = set(ATMOS_OUTPUT_FORMATS)
         resolver_adapters = adapters
         if cfg.output_format in _atmos_formats:
+            # Pass the FULL adapter list — the resolver pins Atmos to the right
+            # service itself. Running the source-preference filter here produced
+            # an EMPTY adapter list on the website, because "tidal" aliases to
+            # "hifi" and no adapter is named "hifi" (v1.1.6). Do not "optimise"
+            # this branch away.
             resolver_adapters = adapters
         elif "auto" in normalized_source_preferences:
             resolver_adapters = sorted(adapters, key=lambda adapter: adapter.priority)
@@ -1895,6 +2034,7 @@ class AntraService:
                 single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
                 album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
                 folder_structure_template=getattr(cfg, "folder_structure_template", ""),
+                flat_library_root=getattr(cfg, "flat_library_root", False),
                 multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
                 track_number_padding=getattr(cfg, "track_number_padding", 2),
                 illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
@@ -1907,7 +2047,37 @@ class AntraService:
             lyrics_fetcher = LyricsFetcher(
                 musixmatch_api_key=cfg.musixmatch_api_key or None,
                 genius_api_key=cfg.genius_api_key or None,
+                # v1.1.8 FEAT-9 — Apple Music is the strongest synced-lyrics
+                # source and the only one with real non-Western coverage, so it
+                # goes first in the waterfall when the mirror is configured.
+                apple_mirrors=_resolve_apple_mirrors(cfg),
+                mirror_api_key=_resolve_mirror_api_key(cfg),
             )
+
+        # ANTRA_MAX_WORKERS is set to 4 by the Go desktop layer when a
+        # supporter/admin key is detected; defaults to 1 for regular users.
+        try:
+            _max_workers = max(1, int(os.environ.get("ANTRA_MAX_WORKERS", "1")))
+        except ValueError:
+            _max_workers = 1
+
+        # Resolve-ahead threads. Enabled only for multi-worker (supporter) runs:
+        # with a single worker this would double the concurrent requests the
+        # mirrors see from free users, and FEAT-7's constraint is that free-tier
+        # behaviour must not change. ANTRA_PREFETCH_RESOLVES overrides it, and 0
+        # is a clean kill switch back to fully inline resolution.
+        #
+        # Sized to the worker count rather than a smaller fixed number. Measured:
+        # 2 threads against 4 workers tops out at a 50% hit rate when a resolve
+        # costs about as much as a download, because production simply cannot
+        # match consumption. This does NOT double the request rate — the queue is
+        # depth-bounded, so surplus threads idle instead of fetching. Thread
+        # count sets the burst ceiling; consumption sets the steady-state rate.
+        try:
+            _prefetch = int(os.environ.get("ANTRA_PREFETCH_RESOLVES", ""))
+        except ValueError:
+            _prefetch = _max_workers if _max_workers > 1 else 0
+        _prefetch = max(0, _prefetch)
 
         engine_cfg = EngineConfig(
             max_retries=cfg.max_retries,
@@ -1916,9 +2086,11 @@ class AntraService:
             save_cover_art_sidecar=getattr(cfg, "save_cover_art_sidecar", False),
             output_format=cfg.output_format,
             strict_matching=getattr(cfg, "strict_matching", False),
-            # ANTRA_MAX_WORKERS is set to 3 by the Go desktop layer when a
-            # supporter/admin key is detected; defaults to 1 for regular users.
-            max_workers=int(os.environ.get("ANTRA_MAX_WORKERS", "1")),
+            strict_format=getattr(cfg, "strict_format", True),
+            prevent_lossy_transcode=getattr(cfg, "prevent_lossy_transcode", True),
+            write_antra_tags=getattr(cfg, "write_antra_tags", True),
+            max_workers=_max_workers,
+            prefetch_resolves=_prefetch,
         )
 
         return DownloadEngine(

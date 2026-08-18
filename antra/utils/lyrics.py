@@ -1,109 +1,497 @@
-import re
-import requests
-import logging
-from typing import Optional, Tuple, TYPE_CHECKING
+"""
+Lyrics fetching — synced-first waterfall across multiple providers (v1.1.8 FEAT-9).
 
-if TYPE_CHECKING:
-    from antra.core.models import TrackMetadata
+The previous implementation had two sources and one controlling bug:
+
+    lrc = self._fetch_lrclib(track)
+    if lrc:
+        plain, synced = lrc
+        if plain or synced:        # <-- `plain` alone satisfied this
+            return plain, synced   # <-- the synced source was NEVER tried
+
+LRCLIB has very large *plain-only* coverage, so any track where it had text but
+no timings returned immediately and never consulted a provider that might have
+had synced lyrics. That single `or` is the mechanical explanation for
+"most lyrics are not synced" — it was a priority bug, not a coverage problem.
+
+This module inverts the rule: **never settle for unsynced lyrics while an
+unqueried provider might have synced ones.** The best result so far is kept and
+only returned once the whole chain is exhausted.
+
+Provider order (best synced coverage first), measured 2026-07-30:
+
+  1. Apple Music (via our own mirror) — by far the best, and the only one with
+     meaningful non-Western coverage. On a Hindi sample Apple returned synced
+     lyrics for Kesariya (44 lines), Chaiyya Chaiyya (94) and Tum Hi Ho (36),
+     while LRCLIB found *nothing at all* for any of them.
+  2. LRCLIB — excellent where it has data, free, no key. Queried with several
+     phrasings (with album, without album, search, simplified title), an idea
+     taken from SpotiFLAC's `FetchLyricsAllSources`.
+  3. Paxsenix — Spotify-derived LRC, last resort.
+
+Every candidate is verified before it is accepted (see `_candidate_is_plausible`).
+Attaching a *different song's* lyrics is the lyrics-shaped version of BUG-1, and
+the old `results[0]` search fallback could do exactly that.
+"""
+import logging
+import re
+from typing import Optional, Tuple
+
+import requests
 
 logger = logging.getLogger(__name__)
 
+# A synced candidate whose final timestamp runs far past the track is a
+# different (usually longer) recording.
+_MAX_OVERRUN_SECONDS = 30
+# Fewer than this many timed lines for a full-length track is a placeholder or a
+# mis-parse, not real synced lyrics.
+_MIN_SYNCED_LINES = 3
+
+
+def _norm(text: str) -> str:
+    """Loose normalisation for comparing titles/artists across providers."""
+    text = (text or "").lower()
+    text = re.sub(r"\(.*?\)|\[.*?\]", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _tokens_overlap(a: str, b: str) -> float:
+    ta, tb = set(_norm(a).split()), set(_norm(b).split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(1, min(len(ta), len(tb)))
+
+
+def last_lrc_timestamp_seconds(lrc: str) -> Optional[float]:
+    """Seconds of the final timestamp in an LRC block, or None."""
+    stamps = re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\]", lrc or "")
+    if not stamps:
+        return None
+    try:
+        return max(int(m) * 60 + float(s) for m, s in stamps)
+    except Exception:
+        return None
+
+
+def count_synced_lines(lrc: str) -> int:
+    return len([ln for ln in (lrc or "").splitlines() if re.match(r"\s*\[\d+:\d+", ln)])
+
+
 class LyricsFetcher:
-    """
-    Fetches plain and synced lyrics from multiple providers.
-    Primarily uses LRCLIB (free, no key, high-quality synced lyrics).
-    """
-    def __init__(self, musixmatch_api_key: Optional[str] = None, genius_api_key: Optional[str] = None):
+    """Multi-provider, synced-first lyrics resolution."""
+
+    def __init__(
+        self,
+        musixmatch_api_key: Optional[str] = None,
+        genius_api_key: Optional[str] = None,
+        apple_mirrors: Optional[list] = None,
+        mirror_api_key: str = "",
+        use_cache: bool = True,
+    ):
         self.musixmatch_key = musixmatch_api_key
         self.genius_key = genius_api_key
+        self._apple_mirrors = [m.rstrip("/") for m in (apple_mirrors or []) if m]
+        self._mirror_api_key = mirror_api_key or ""
+        self._use_cache = use_cache
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Antra/1.0 (https://github.com/afkarxyz/antra)"
-        })
+        self.session.headers.update({"User-Agent": "Antra/1.1.8"})
 
-    def fetch(self, track: "TrackMetadata") -> Tuple[Optional[str], Optional[str]]:
-        """
-        Fetch lyrics for a track.
-        Returns (plain_text, synced_lrc).
-        """
-        logger.debug(f"[Lyrics] Fetching for: {track.artist_string} - {track.title}")
-        
-        # 1. Try LRCLIB (Best for synced lyrics)
-        try:
-            lrc = self._fetch_lrclib(track)
-            if lrc:
-                plain, synced = lrc
+    # ── public API ─────────────────────────────────────────────────────────
+    def fetch(self, track) -> Tuple[Optional[str], Optional[str]]:
+        """Return (plain_text, synced_lrc). Either may be None."""
+        cache = self._cache()
+        if cache:
+            hit = cache.get(track)
+            if hit is not None:
+                plain, synced, provider = hit
                 if plain or synced:
-                    return plain, synced
-        except Exception as e:
-            logger.debug(f"[Lyrics] LRCLIB failed: {e}")
+                    logger.debug(
+                        "[Lyrics] cache hit for '%s' (provider=%s, synced=%s)",
+                        track.title, provider, bool(synced),
+                    )
+                return (plain or None), (synced or None)
 
-        # 2. Try Paxsenix (synced LRC from Spotify ID — no key needed)
-        if track.spotify_id:
+        best_plain: Optional[str] = None
+        best_provider = ""
+        # A host that is unreachable stays unreachable for the rest of the run.
+        # Several providers share one host (four LRCLIB query shapes), so without
+        # this a dead host costs 4 x timeout *per track* — measured at 71s for a
+        # single track when LRCLIB was unreachable. Per-fetch, not persistent:
+        # a host that recovers mid-library is picked up on the next track.
+        dead_hosts: set = set()
+
+        for name, provider in self._providers(track):
+            host = name.split("-", 1)[0]
+            if host in dead_hosts:
+                logger.debug("[Lyrics] skipping %s — %s unreachable this run", name, host)
+                continue
             try:
-                lrc = self._fetch_paxsenix(track)
-                if lrc:
-                    plain, synced = lrc
-                    if plain or synced:
-                        return plain, synced
+                result = provider()
             except Exception as e:
-                logger.debug(f"[Lyrics] Paxsenix failed: {e}")
+                if self._is_unreachable(e):
+                    dead_hosts.add(host)
+                    logger.warning(
+                        "[Lyrics] %s unreachable (%s) — skipping its remaining "
+                        "queries for this track", host, type(e).__name__,
+                    )
+                else:
+                    logger.debug("[Lyrics] %s failed: %s", name, e)
+                continue
+            if not result:
+                continue
+            plain, synced = result
+            plain = (plain or "").strip()
+            synced = (synced or "").strip()
+            if not plain and not synced:
+                continue
 
+            if not self._candidate_is_plausible(track, plain, synced, name):
+                continue
+
+            if synced:
+                logger.info(
+                    "[Lyrics] %s — SYNCED via %s (%d lines)",
+                    track.title, name, count_synced_lines(synced),
+                )
+                if cache:
+                    cache.put(track, plain, synced, name)
+                return (plain or None), synced
+
+            # Plain only: remember it, but keep looking for synced. This is the
+            # inversion of the old behaviour and the core of the fix.
+            if best_plain is None:
+                best_plain, best_provider = plain, name
+                logger.debug(
+                    "[Lyrics] %s — plain-only via %s, continuing to look for synced",
+                    track.title, name,
+                )
+
+        if best_plain:
+            logger.info("[Lyrics] %s — plain only (via %s); no synced found anywhere",
+                        track.title, best_provider)
+            if cache:
+                cache.put(track, best_plain, "", best_provider)
+            return best_plain, None
+
+        logger.debug("[Lyrics] %s — no lyrics found in any provider", track.title)
+        if cache:
+            cache.put(track, "", "", "")
         return None, None
 
-    def _fetch_paxsenix(self, track: "TrackMetadata") -> Optional[Tuple[str, str]]:
-        """Fetch synced LRC lyrics from Paxsenix using Spotify track ID."""
-        resp = self.session.get(
+    # ── provider chain ─────────────────────────────────────────────────────
+    def _providers(self, track):
+        """Ordered (name, callable) pairs — cheapest good answer first.
+
+        **LRCLIB leads, Apple follows.** The first cut had Apple first, on an
+        investigation that reported LRCLIB finding nothing for regional
+        catalogues. Measuring from the VPS disproved that: LRCLIB answered every
+        test track with synced lyrics **in 0.2-0.3s**, while an Apple lookup
+        costs an ISRC resolution against a pool that rotates ~15 accounts with
+        waits between them — 5.9s on a good run, a 10s timeout on a bad one.
+        Apple-first therefore added minutes per album to reach an answer LRCLIB
+        already had.
+
+        Ordering by cost does NOT weaken the synced-first rule, which is the
+        actual fix in this feature: a plain-only LRCLIB hit still falls through
+        to Apple, because `fetch()` only stops early on *synced* lyrics. The
+        single thing given up is preferring Apple's timings when both have
+        synced — not worth a 30x latency cost.
+
+        On the desktop the order is self-correcting: LRCLIB is unreachable on
+        some ISPs, the unreachable-host breaker skips its remaining query shapes
+        after the first transport failure, and Apple runs anyway.
+        """
+        chain = []
+        chain.append(("lrclib", lambda: self._fetch_lrclib_exact(track, with_album=True)))
+        if track.album:
+            chain.append(("lrclib-noalbum", lambda: self._fetch_lrclib_exact(track, with_album=False)))
+        chain.append(("lrclib-search", lambda: self._fetch_lrclib_search(track, track.title)))
+        simplified = self._simplify_title(track.title)
+        if simplified and simplified.lower() != (track.title or "").lower():
+            chain.append(("lrclib-simplified", lambda: self._fetch_lrclib_search(track, simplified)))
+        if self._apple_mirrors:
+            chain.append(("apple", lambda: self._fetch_apple(track)))
+        if getattr(track, "spotify_id", None):
+            chain.append(("paxsenix", lambda: self._fetch_paxsenix(track)))
+        return chain
+
+    @staticmethod
+    def _is_unreachable(exc: Exception) -> bool:
+        """True when the host could not be reached at all, as opposed to
+        answering with 'no lyrics'. Only a transport failure justifies skipping
+        a provider's remaining queries — an HTTP 404 says nothing about whether
+        a *different* query shape against the same host would succeed.
+        """
+        try:
+            from requests.exceptions import (ConnectionError as ReqConnErr,
+                                             RequestException, Timeout)
+            if isinstance(exc, (Timeout, ReqConnErr)):
+                return True
+            # Every requests error subclasses OSError, so the fallback below
+            # would otherwise treat an HTTP 500 as "host unreachable" and
+            # disable the remaining query shapes against a host that answered.
+            if isinstance(exc, RequestException):
+                return False
+        except Exception:  # pragma: no cover - requests always present in practice
+            pass
+        return isinstance(exc, (OSError, TimeoutError))
+
+    # ── quality gates ──────────────────────────────────────────────────────
+    def _candidate_is_plausible(self, track, plain: str, synced: str, provider: str) -> bool:
+        """Reject lyrics that are probably for a different recording.
+
+        This is the lyrics-shaped version of BUG-1's identity gate. The old
+        implementation took `results[0]` from an LRCLIB search with no checks at
+        all, which could attach a completely different song's words to a track —
+        invisible in the file browser, obvious the moment you play it.
+        """
+        if synced:
+            lines = count_synced_lines(synced)
+            if lines < _MIN_SYNCED_LINES:
+                logger.debug("[Lyrics] rejected %s candidate — only %d timed lines",
+                             provider, lines)
+                return False
+            last = last_lrc_timestamp_seconds(synced)
+            dur = (getattr(track, "duration_ms", None) or 0) / 1000.0
+            if last is not None and dur > 0 and last > dur + _MAX_OVERRUN_SECONDS:
+                logger.info(
+                    "[Lyrics] rejected %s candidate for '%s' — lyrics run to %.0fs "
+                    "but the track is %.0fs (different recording)",
+                    provider, track.title, last, dur,
+                )
+                return False
+        return True
+
+    @staticmethod
+    def _simplify_title(title: str) -> str:
+        """Drop decorations that stop a catalogue matching: feat credits,
+        version and remaster tags. Borrowed from SpotiFLAC's simplifyTrackName."""
+        t = re.sub(r"\s*[\(\[](feat\.?|ft\.?|with|featuring)[^\)\]]*[\)\]]", "", title or "",
+                   flags=re.IGNORECASE)
+        # The year is optional and can sit on either side of the tag — Spotify
+        # writes "- 2011 Remaster", Apple writes "- Remastered 2011".
+        t = re.sub(
+            r"\s*-\s*(\d{4}\s+)?(remaster(ed)?|single version|album version|radio edit)\b.*$",
+            "", t, flags=re.IGNORECASE)
+        t = re.sub(r"\s*[\(\[][^\)\]]*(remaster|version|edit)[^\)\]]*[\)\]]", "", t,
+                   flags=re.IGNORECASE)
+        return t.strip()
+
+    # ── providers ──────────────────────────────────────────────────────────
+    def _resolve_apple_id_by_isrc(self, isrc: str) -> Optional[str]:
+        """Apple catalog id for an ISRC, via our authenticated mirror."""
+        if not self._apple_mirrors:
+            return None
+        headers = {"X-API-Key": self._mirror_api_key} if self._mirror_api_key else {}
+        for base in self._apple_mirrors:
+            try:
+                r = self.session.get(
+                    f"{base.rstrip('/')}/api/search/isrc/{isrc}",
+                    headers=headers,
+                    # This pool rotates through ~15 accounts with 2-5s waits, so
+                    # 10s was too tight — measured 5.9s on a good run and a
+                    # timeout on a slow one. Affordable now only because Apple
+                    # sits AFTER LRCLIB: it is reached for the minority of
+                    # tracks LRCLIB could not answer, not for every track.
+                    timeout=20,
+                )
+            except Exception as e:
+                logger.debug("[Lyrics] apple isrc lookup unreachable (%s): %s", base, e)
+                continue
+            if r.status_code == 404:
+                # No Apple track for THIS ISRC. Deliberately falls through to the
+                # text search rather than giving up: a track's metadata ISRC is
+                # often for a different release of the same recording, and the
+                # text path is verified on title + artist + duration before it is
+                # trusted, so the "wrong song's lyrics" risk is already covered.
+                # Treating this as authoritative would cost coverage for nothing.
+                return None
+            if r.status_code != 200:
+                logger.debug("[Lyrics] apple isrc lookup %s returned %s", base, r.status_code)
+                continue
+            try:
+                track_id = str((r.json() or {}).get("track_id") or "").strip()
+            except Exception:
+                continue
+            if track_id:
+                logger.debug("[Lyrics] apple id %s resolved from ISRC %s", track_id, isrc)
+                return track_id
+        return None
+
+    def _fetch_apple(self, track) -> Optional[Tuple[str, str]]:
+        """Apple Music lyrics via our mirror's /api/lyrics endpoint.
+
+        Needs an Apple catalog track id. When the track did not come from an
+        Apple URL we resolve one from the public iTunes Search API, and verify
+        the match before trusting it — an unverified id would attach the wrong
+        song's lyrics.
+        """
+        track_id = getattr(track, "apple_music_id", None)
+        if not track_id:
+            track_id = self._resolve_apple_id(track)
+        if not track_id:
+            return None
+
+        headers = {"X-API-Key": self._mirror_api_key} if self._mirror_api_key else {}
+        for base in self._apple_mirrors:
+            try:
+                r = self.session.get(
+                    f"{base}/api/lyrics/{track_id}", headers=headers, timeout=25,
+                )
+            except Exception as e:
+                logger.debug("[Lyrics] apple mirror %s unreachable: %s", base, e)
+                continue
+            if r.status_code == 404:
+                return None          # Apple genuinely has no lyrics for this track
+            if r.status_code != 200:
+                logger.debug("[Lyrics] apple mirror %s returned %s", base, r.status_code)
+                continue
+            try:
+                data = r.json()
+            except Exception:
+                continue
+            return data.get("plain") or "", data.get("synced") or ""
+        return None
+
+    def _resolve_apple_id(self, track) -> Optional[str]:
+        """Find the Apple catalog id for a track.
+
+        ISRC through our own mirror first, then the public iTunes Search API.
+        The order matters and is not just a preference:
+
+        * iTunes Search rate-limits **per IP in bursts** and answers `403` with
+          an empty body once tripped. One lookup per album is fine; one per
+          track is not — that is precisely the bug the v1.1.7 artwork upgrade
+          hit, where a 20-track album silently lost its hi-res covers partway
+          through. Lyrics are per-track, so leading with iTunes would reproduce
+          it exactly.
+        * The mirror's `/api/search/isrc/{isrc}` is authenticated with real
+          account credentials and is therefore immune to that ban — the same
+          fallback the artwork path already relies on.
+        * An ISRC match needs no fuzzy verification: it identifies the exact
+          recording, so unlike the text-search path there is no risk of
+          attaching another song's lyrics.
+        """
+        isrc = (getattr(track, "isrc", "") or "").strip().upper()
+        if isrc:
+            found = self._resolve_apple_id_by_isrc(isrc)
+            if found:
+                return found
+
+        title = (track.title or "").strip()
+        artist = (getattr(track, "primary_artist", "") or "").strip()
+        if not title:
+            return None
+        try:
+            r = self.session.get(
+                "https://itunes.apple.com/search",
+                params={"term": f"{title} {artist}".strip(), "entity": "song", "limit": 5},
+                timeout=15,
+            )
+            if r.status_code != 200:
+                return None
+            results = r.json().get("results") or []
+        except Exception:
+            return None
+
+        for item in results:
+            got_title = item.get("trackName") or ""
+            got_artist = item.get("artistName") or ""
+            if _tokens_overlap(title, got_title) < 0.6:
+                continue
+            if artist and _tokens_overlap(artist, got_artist) < 0.4:
+                continue
+            dur = (getattr(track, "duration_ms", None) or 0)
+            got_dur = item.get("trackTimeMillis") or 0
+            if dur and got_dur and abs(dur - got_dur) > 15000:
+                continue
+            tid = item.get("trackId")
+            if tid:
+                return str(tid)
+        return None
+
+    def _fetch_lrclib_exact(self, track, with_album: bool) -> Optional[Tuple[str, str]]:
+        params = {
+            "artist_name": getattr(track, "primary_artist", None),
+            "track_name": track.title,
+            "duration": getattr(track, "duration_seconds", None),
+        }
+        if with_album and track.album:
+            params["album_name"] = track.album
+        params = {k: v for k, v in params.items() if v}
+        r = self.session.get("https://lrclib.net/api/get", params=params, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        return data.get("plainLyrics") or "", data.get("syncedLyrics") or ""
+
+    def _fetch_lrclib_search(self, track, title: str) -> Optional[Tuple[str, str]]:
+        """Search LRCLIB, preferring a SYNCED result and verifying the match.
+
+        The old code took `results[0]` blindly. Here every candidate is checked
+        against title/artist/duration, and a synced hit is preferred over the
+        first hit.
+        """
+        artist = getattr(track, "primary_artist", "") or ""
+        r = self.session.get(
+            "https://lrclib.net/api/search",
+            params={"q": f"{artist} {title}".strip()},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        try:
+            results = r.json() or []
+        except Exception:
+            return None
+
+        dur = (getattr(track, "duration_ms", None) or 0) / 1000.0
+        plain_fallback = None
+        for item in results[:10]:
+            if _tokens_overlap(title, item.get("trackName") or "") < 0.6:
+                continue
+            if artist and _tokens_overlap(artist, item.get("artistName") or "") < 0.4:
+                continue
+            item_dur = item.get("duration") or 0
+            if dur and item_dur and abs(dur - item_dur) > 15:
+                continue
+            synced = item.get("syncedLyrics") or ""
+            plain = item.get("plainLyrics") or ""
+            if synced:
+                return plain, synced
+            if plain and plain_fallback is None:
+                plain_fallback = plain
+        return (plain_fallback, "") if plain_fallback else None
+
+    def _fetch_paxsenix(self, track) -> Optional[Tuple[str, str]]:
+        r = self.session.get(
             "https://lyrics.paxsenix.org/spotify/lyrics",
             params={"id": track.spotify_id},
-            timeout=10,
+            timeout=15,
         )
-        if resp.status_code != 200:
+        if r.status_code != 200:
             return None
-        # Response is a JSON string containing the raw LRC text
         try:
-            lrc_text = resp.json()  # returns a plain string
+            lrc_text = r.json()
         except Exception:
-            lrc_text = resp.text.strip().strip('"')
+            lrc_text = r.text.strip().strip('"')
         if not lrc_text or not isinstance(lrc_text, str):
             return None
-        # Paxsenix only provides synced LRC; strip timestamps for plain fallback
-        plain = re.sub(r'^\[\d+:\d+\.\d+\]', '', lrc_text, flags=re.MULTILINE).strip()
-        return plain or None, lrc_text
+        plain = re.sub(r"^\[\d+:\d+\.\d+\]", "", lrc_text, flags=re.MULTILINE).strip()
+        return plain, lrc_text
 
-    def _fetch_lrclib(self, track: "TrackMetadata") -> Optional[Tuple[str, str]]:
-        """Fetch from lrclib.net API."""
-        params = {
-            "artist_name": track.primary_artist,
-            "track_name": track.title,
-            "album_name": track.album,
-            "duration": track.duration_seconds
-        }
-        
-        # Cleanup params — remove None
-        params = {k: v for k, v in params.items() if v is not None}
-        
+    # ── cache ──────────────────────────────────────────────────────────────
+    def _cache(self):
+        if not self._use_cache:
+            return None
         try:
-            resp = self.session.get("https://lrclib.net/api/get", params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                plain = data.get("plainLyrics")
-                synced = data.get("syncedLyrics")
-                return plain, synced
-            
-            # If not found via exact match, try search
-            search_resp = self.session.get("https://lrclib.net/api/search", params={"q": f"{track.primary_artist} {track.title}"}, timeout=10)
-            if search_resp.status_code == 200:
-                results = search_resp.json()
-                if results:
-                    # Pick first result
-                    res = results[0]
-                    return res.get("plainLyrics"), res.get("syncedLyrics")
-                    
-        except Exception as e:
-            logger.debug(f"[Lyrics] LRCLIB request error: {e}")
-            
-        return None
+            from antra.utils.lyrics_cache import get_lyrics_cache
+            return get_lyrics_cache()
+        except Exception:
+            return None
+
 
 def validate_and_strip_lrc(lrc_text: str, duration_ms: int) -> str:
     """

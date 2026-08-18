@@ -30,6 +30,9 @@ export namespace main {
 	    library_mode?: string;
 	    prefer_explicit?: boolean;
 	    strict_matching: boolean;
+	    strict_format?: boolean;
+	    prevent_lossy_transcode?: boolean;
+	    write_antra_tags?: boolean;
 	    folder_structure?: string;
 	    album_folder_structure?: string;
 	    playlist_folder_structure?: string;
@@ -55,7 +58,12 @@ export namespace main {
 	    tidal_token_type?: string;
 	    tidal_country_code?: string;
 	    antra_api_key?: string;
+	    antra_device_token?: string;
 	    theme?: string;
+	    font?: string;
+	    notify_sound?: string;
+	    notify_volume?: number;
+	    notify_batch_only?: boolean;
 	    download_source?: string;
 	    download_sources?: string[];
 	    save_cover_art_sidecar: boolean;
@@ -100,6 +108,9 @@ export namespace main {
 	        this.library_mode = source["library_mode"];
 	        this.prefer_explicit = source["prefer_explicit"];
 	        this.strict_matching = source["strict_matching"];
+	        this.strict_format = source["strict_format"];
+	        this.prevent_lossy_transcode = source["prevent_lossy_transcode"];
+	        this.write_antra_tags = source["write_antra_tags"];
 	        this.folder_structure = source["folder_structure"];
 	        this.album_folder_structure = source["album_folder_structure"];
 	        this.playlist_folder_structure = source["playlist_folder_structure"];
@@ -125,7 +136,12 @@ export namespace main {
 	        this.tidal_token_type = source["tidal_token_type"];
 	        this.tidal_country_code = source["tidal_country_code"];
 	        this.antra_api_key = source["antra_api_key"];
+	        this.antra_device_token = source["antra_device_token"];
 	        this.theme = source["theme"];
+	        this.font = source["font"];
+	        this.notify_sound = source["notify_sound"];
+	        this.notify_volume = source["notify_volume"];
+	        this.notify_batch_only = source["notify_batch_only"];
 	        this.download_source = source["download_source"];
 	        this.download_sources = source["download_sources"];
 	        this.save_cover_art_sidecar = source["save_cover_art_sidecar"];
@@ -134,6 +150,100 @@ export namespace main {
 	        this.auto_sync_minute = source["auto_sync_minute"];
 	        this.auto_sync_days = source["auto_sync_days"];
 	        this.tracked_playlists = source["tracked_playlists"];
+	    }
+	}
+	export class DeviceAccountStatus {
+	    signed_in: boolean;
+	    valid: boolean;
+	    reachable: boolean;
+	    is_supporter: boolean;
+	    tier?: string;
+	    username?: string;
+	    expires_at?: number;
+	    should_renew?: boolean;
+	    error?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DeviceAccountStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.signed_in = source["signed_in"];
+	        this.valid = source["valid"];
+	        this.reachable = source["reachable"];
+	        this.is_supporter = source["is_supporter"];
+	        this.tier = source["tier"];
+	        this.username = source["username"];
+	        this.expires_at = source["expires_at"];
+	        this.should_renew = source["should_renew"];
+	        this.error = source["error"];
+	    }
+	}
+	export class DeviceCodeResult {
+	    device_code: string;
+	    user_code: string;
+	    verification_url: string;
+	    expires_in: number;
+	    interval: number;
+	    error?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DeviceCodeResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.device_code = source["device_code"];
+	        this.user_code = source["user_code"];
+	        this.verification_url = source["verification_url"];
+	        this.expires_in = source["expires_in"];
+	        this.interval = source["interval"];
+	        this.error = source["error"];
+	    }
+	}
+	export class DeviceRenewResult {
+	    status: string;
+	    token?: string;
+	    expires_at?: number;
+	    tier?: string;
+	    username?: string;
+	    days_left?: number;
+	    error?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DeviceRenewResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.status = source["status"];
+	        this.token = source["token"];
+	        this.expires_at = source["expires_at"];
+	        this.tier = source["tier"];
+	        this.username = source["username"];
+	        this.days_left = source["days_left"];
+	        this.error = source["error"];
+	    }
+	}
+	export class DeviceTokenResult {
+	    status: string;
+	    token?: string;
+	    username?: string;
+	    tier?: string;
+	    error?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DeviceTokenResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.status = source["status"];
+	        this.token = source["token"];
+	        this.username = source["username"];
+	        this.tier = source["tier"];
+	        this.error = source["error"];
 	    }
 	}
 	export class HistoryItem {
@@ -175,6 +285,7 @@ export namespace main {
 	    download_count?: number;
 	    usage_today?: Record<string, any>;
 	    error?: string;
+	    reachable: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new KeyInfoResult(source);
@@ -190,6 +301,7 @@ export namespace main {
 	        this.download_count = source["download_count"];
 	        this.usage_today = source["usage_today"];
 	        this.error = source["error"];
+	        this.reachable = source["reachable"];
 	    }
 	}
 

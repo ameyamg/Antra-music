@@ -17,6 +17,11 @@ if sys.platform == "win32":
 
 OUTPUT_FORMAT_EXTENSION = {
     "source":      None,
+    # Atmos keeps its own container; .mp4 never .m4a (ipod muxer rejects EC-3).
+    "atmos":        None,
+    "atmos-tidal":  None,
+    "atmos-apple":  None,
+    "atmos-amazon": None,
     "lossless":    None,
     "lossless-16": None,
     "lossless-24": None,
@@ -38,10 +43,84 @@ class ConversionPlan:
 
 
 class AudioTranscoder:
-    _LOSSY_EXTENSIONS = {".mp3", ".aac"}
+    _LOSSY_EXTENSIONS = {".mp3", ".aac", ".ogg", ".opus"}
+    # Lossy formats that live in an MP4 container cannot be identified by
+    # extension alone — .m4a is used by both ALAC (lossless) and AAC (lossy).
+    _MP4_CONTAINER_EXTENSIONS = {".m4a", ".mp4"}
+
+    def __init__(self, prevent_lossy_transcode: bool = True):
+        # v1.1.8 FEAT-2 — when True, one lossy format is never re-encoded into a
+        # different lossy format. Same-format output is unaffected: that path is
+        # already a stream copy / remux rather than a re-encode.
+        self.prevent_lossy_transcode = prevent_lossy_transcode
 
     def _is_lossy(self, file_path: str) -> bool:
-        return os.path.splitext(file_path)[1].lower() in self._LOSSY_EXTENSIONS
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in self._LOSSY_EXTENSIONS:
+            return True
+        if ext in self._MP4_CONTAINER_EXTENSIONS:
+            # Judging .m4a by extension alone treated an AAC file as lossless, so
+            # in lossless mode it was transcoded straight to FLAC — producing a
+            # fake-lossless file. Probe the real codec instead (v1.1.8 FEAT-2/3).
+            return self._mp4_is_lossy(file_path)
+        return False
+
+    @staticmethod
+    def _mp4_is_lossy(file_path: str) -> bool:
+        """True if an MP4-family file holds a lossy codec, False if lossless.
+
+        Returns False ("treat as lossless") when the codec cannot be determined,
+        preserving previous behaviour rather than newly rejecting files on an
+        inconclusive probe.
+        """
+        try:
+            from mutagen.mp4 import MP4
+            info = getattr(MP4(file_path), "info", None)
+            codec = str(getattr(info, "codec", "") or "").lower()
+            if not codec:
+                # ALAC reports a real bit depth; AAC reports 0/None.
+                return not bool(getattr(info, "bits_per_sample", None))
+            if codec.startswith("alac"):
+                return False
+            if codec.startswith(("mp4a", "aac")):
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _lossy_family(self, file_path: str) -> str:
+        """Coarse lossy-format identity, used to tell a re-encode (different
+        family) from a remux (same family)."""
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".mp3":
+            return "mp3"
+        if ext in {".aac", ".m4a", ".mp4"}:
+            return "aac"
+        if ext in {".ogg", ".opus"}:
+            return "opus"
+        return ext.lstrip(".")
+
+    @staticmethod
+    def _target_lossy_family(target_format: str) -> "str | None":
+        base = (target_format or "").lower()
+        if base == "mp3":
+            return "mp3"
+        if base in {"aac", "m4a"}:
+            return "aac"
+        return None
+
+    def blocks_lossy_reencode(self, file_path: str, target_format: str) -> bool:
+        """True when this conversion would be a lossy → different-lossy re-encode
+        and FEAT-2 is enabled. Requesting MP3 and receiving AAC is the reported
+        case: re-encoding it is pure generation loss."""
+        if not self.prevent_lossy_transcode:
+            return False
+        target_family = self._target_lossy_family(target_format)
+        if target_family is None:
+            return False  # lossless target — encoding once is correct
+        if not self._is_lossy(file_path):
+            return False  # lossless source — encoding once is correct
+        return self._lossy_family(file_path) != target_family
 
     def needs_conversion(self, file_path: str, target_format: str) -> bool:
         # Normalise bit-depth variants to their base format for conversion logic.
@@ -53,6 +132,18 @@ class AudioTranscoder:
         wants_16 = target_format.endswith("-16")
 
         if base_format == "source":
+            return False
+
+        # Dolby Atmos is delivered as E-AC-3/AC-4 in an .mp4 and must be passed
+        # through untouched (v1.1.8 FEAT-1). ffmpeg's `ipod` muxer refuses these
+        # codecs outright, and re-encoding would destroy the spatial mix.
+        if base_format.startswith("atmos"):
+            return False
+
+        # FEAT-2: refuse a lossy → different-lossy re-encode. Checked before the
+        # per-format branches below, which otherwise return True unconditionally
+        # for aac/m4a targets and would happily re-encode an AAC source to MP3.
+        if self.blocks_lossy_reencode(file_path, base_format):
             return False
         if base_format == "lossless":
             ext = os.path.splitext(file_path)[1].lower()

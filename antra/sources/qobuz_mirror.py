@@ -17,6 +17,8 @@ from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.sources.base import BaseSourceAdapter, RateLimitedError
 from antra.utils.matching import score_similarity, duration_close, strip_collab
 
+from antra.utils.mirror_http import TlsFallbackSession, humanize_network_error
+
 logger = logging.getLogger(__name__)
 
 MIN_SIMILARITY = 0.55
@@ -32,7 +34,10 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
 
     def __init__(self, mirror_url: str, api_key: str = "", preferred_output_format: str = "source"):
         self._base = mirror_url.rstrip("/")
-        self._session = requests.Session()
+        # v1.1.8 BUG-2: TLS-resilient session (curl_cffi fallback + proxy
+        # diagnostics). Lifted from the Amazon adapter so all mirrors
+        # behave the same on hostile networks.
+        self._session = TlsFallbackSession("QobuzMirror")
         self._session.headers.update({"User-Agent": "Antra/1.0", "Accept": "application/json"})
         if api_key:
             self._session.headers["X-API-Key"] = api_key
@@ -305,10 +310,32 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
 
         final_path = output_path + ext
         os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
-        with open(final_path, "wb") as f:
-            for chunk in r.iter_content(131072):
-                if chunk:
-                    f.write(chunk)
+        # Atomic write (v1.1.8 BUG-4): stream into a .part file and only move it
+        # into place once the transfer completes. Previously this streamed
+        # straight into final_path, so a connection dropped mid-transfer left a
+        # partial, untagged file sitting in the library — the reported
+        # "1.2 MB won't play, no metadata" case. A partial can now never appear
+        # under the real filename.
+        # NOTE: the .part name is derived from output_path (the stem), NOT from
+        # final_path. `final_path + ".part"` would be 5 characters LONGER than the
+        # file we are about to write, which on Windows (MAX_PATH 260, and
+        # LongPathsEnabled is 0 on a default install) can push a path that would
+        # otherwise have worked over the limit — turning a working download into
+        # a FileNotFoundError. Deep classical box sets hit this easily. Using the
+        # stem keeps the temp name exactly as long as the final one.
+        part_path = output_path + ".part"
+        try:
+            with open(part_path, "wb") as f:
+                for chunk in r.iter_content(131072):
+                    if chunk:
+                        f.write(chunk)
+            os.replace(part_path, final_path)
+        except BaseException:
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
+            raise
 
         logger.info("[QobuzMirror] Downloaded %s quality=%s bit_depth=%s",
                     os.path.basename(final_path), quality_hdr, bit_depth_hdr)

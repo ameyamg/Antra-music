@@ -23,6 +23,8 @@ from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.sources.base import BaseSourceAdapter, RateLimitedError
 from antra.utils.matching import score_similarity, duration_close
 
+from antra.utils.mirror_http import TlsFallbackSession, humanize_network_error
+
 logger = logging.getLogger(__name__)
 
 MIN_SIMILARITY = 0.75
@@ -67,7 +69,10 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
 
     def __init__(self, mirror_url: str, api_key: str = ""):
         self._base = mirror_url.rstrip("/")
-        self._session = requests.Session()
+        # v1.1.8 BUG-2: TLS-resilient session (curl_cffi fallback + proxy
+        # diagnostics). Lifted from the Amazon adapter so all mirrors
+        # behave the same on hostile networks.
+        self._session = TlsFallbackSession("DeezerMirror")
         self._session.headers.update({"User-Agent": "Antra/1.0", "Accept": "application/json"})
         if api_key:
             self._session.headers["X-API-Key"] = api_key

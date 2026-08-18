@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,7 @@ from mutagen.id3 import ID3, TALB, TIT2, TPE1, TSRC, TXXX
 from mutagen.mp4 import MP4
 
 from antra.core.models import TrackMetadata
+from antra.utils.longpath import extended_path
 from antra_shared.filename_prefs import (
     build_folder_path,
     build_single_track_stem,
@@ -53,6 +55,7 @@ class LibraryOrganizer:
         single_track_filename_template: str = "",
         album_track_filename_template: str = "",
         folder_structure_template: str = "",
+        flat_library_root: bool = False,
         multi_disc_handling: str = "prefix",
         track_number_padding: int = 2,
         illegal_character_replacement: str = "",
@@ -61,6 +64,9 @@ class LibraryOrganizer:
     ):
         self.root = Path(root).resolve()
         self.full_albums = full_albums
+        # v1.1.8 FEAT-11 — clearing the folder template means "no album folder";
+        # every track lands directly in the library root.
+        self.flat_library_root = bool(flat_library_root)
         legacy_structure = folder_structure or "standard"
         self.folder_structure = legacy_structure
         self.album_folder_structure = album_folder_structure or legacy_structure
@@ -140,6 +146,10 @@ class LibraryOrganizer:
         return s.strip()
 
     def _album_folder(self, track: TrackMetadata) -> Path:
+        # Explicitly-cleared template: no album folder at all. Checked before
+        # build_folder_path, which would otherwise substitute the default.
+        if self.flat_library_root:
+            return self.root
         custom_path = build_folder_path(track, self.filename_preferences)
         if custom_path:
             parts = custom_path.split("/")
@@ -249,7 +259,7 @@ class LibraryOrganizer:
         base = self.get_output_path(track)
         for ext in SUPPORTED_AUDIO_EXTENSIONS:
             candidate = base + ext
-            if os.path.exists(candidate):
+            if os.path.exists(extended_path(candidate)):
                 if self.filename_preferences.get("filename_conflict_behavior") == "overwrite":
                     return None
                 if not self._file_matches_track_identity(track, Path(candidate)):
@@ -305,11 +315,18 @@ class LibraryOrganizer:
             existing_paths = [
                 folder / f"{stem}{ext}"
                 for ext in SUPPORTED_AUDIO_EXTENSIONS
-                if (folder / f"{stem}{ext}").exists()
+                if os.path.exists(extended_path(str(folder / f"{stem}{ext}")))
             ]
             if not existing_paths:
                 return folder / stem
-            if any(self._file_matches_track_identity(track, path) for path in existing_paths):
+            # Only allocate a numbered duplicate when an existing file is
+            # POSITIVELY a different track. "Could not identify it" must not
+            # produce a second copy — that is what turned 201 tracks into 219
+            # (v1.1.8 BUG-3).
+            if not all(
+                self._existing_file_is_positively_different(track, path)
+                for path in existing_paths
+            ):
                 return folder / stem
             counter = 2
             while any((folder / f"{stem} ({counter}){ext}").exists() for ext in SUPPORTED_AUDIO_EXTENSIONS):
@@ -339,6 +356,19 @@ class LibraryOrganizer:
             keys.append(f"isrc:{track.isrc.strip().lower()}")
         if track.spotify_id:
             keys.append(f"spotify:{track.spotify_id.strip()}")
+        # Must mirror the file-side key built in _identity_keys_from_values, or
+        # the two sets can never intersect and the signal is dead weight
+        # (v1.1.8 FEAT-6). UPC is album-level, so it only identifies a track when
+        # combined with BOTH disc and track number — with track number alone,
+        # disc 1 track 1 and disc 2 track 1 of the same release produce the same
+        # key, and the second disc is skipped as "already downloaded" against a
+        # file that is a completely different song (v1.1.8 BUG-10).
+        _upc = getattr(track, "upc", None)
+        if _upc and track.track_number:
+            keys.append(
+                f"upc:{re.sub(r'\D', '', str(_upc))}"
+                f":{int(track.disc_number or 1)}:{int(track.track_number)}"
+            )
 
         title_key = self._normalize_identity_part(track.title)
         artist_key = self._normalize_identity_part(track.primary_artist)
@@ -443,6 +473,32 @@ class LibraryOrganizer:
             return False
         return bool(existing_keys.intersection(self._track_identity_keys(track)))
 
+    def _existing_file_is_positively_different(self, track: TrackMetadata, path: Path) -> bool:
+        """True ONLY when the existing file can be positively identified as a
+        different track (v1.1.8 BUG-3).
+
+        The distinction between *"this is a different track"* and *"I could not
+        tell"* is the whole point. `_file_matches_track_identity` collapses both
+        to False, which is correct where the consequence is "download it again"
+        but wrong where the consequence is "write a second copy alongside it":
+        an existing file that is unreadable, or that carries no usable tags
+        (exactly what a file left behind by failed tagging looks like), was being
+        treated as proof of a different recording and got a ` (2)` duplicate.
+
+        A genuinely distinct same-titled track normally has readable tags, so the
+        case this guard exists for — distinct covers colliding on a title-only
+        filename template — still works.
+        """
+        try:
+            existing_keys = set(self._extract_identity_keys_from_file(path))
+        except Exception as e:
+            logger.debug(f"Could not inspect existing file identity for {path}: {e}")
+            return False  # unknown — never grounds for a duplicate
+        if not existing_keys:
+            logger.debug(f"Existing file has no usable identity tags, assuming ours: {path}")
+            return False  # unknown — never grounds for a duplicate
+        return not existing_keys.intersection(self._track_identity_keys(track))
+
     def _extract_flac_identity_keys(self, path: Path) -> list[str]:
         audio = FLAC(path)
         title = self._first(audio.get("title"))
@@ -450,7 +506,12 @@ class LibraryOrganizer:
         album = self._first(audio.get("album"))
         isrc = self._first(audio.get("isrc"))
         spotify_id = self._first(audio.get("spotify_id"))
-        return self._identity_keys_from_values(title, artists, album, isrc, spotify_id)
+        upc = self._first_upc(dict(audio))
+        track_number = self._parse_track_number(self._first(audio.get("tracknumber")))
+        disc_number = self._parse_track_number(self._first(audio.get("discnumber")))
+        return self._identity_keys_from_values(
+            title, artists, album, isrc, spotify_id, upc, track_number, disc_number
+        )
 
     def _extract_mp3_identity_keys(self, path: Path) -> list[str]:
         audio = ID3(path)
@@ -459,7 +520,26 @@ class LibraryOrganizer:
         album = self._id3_text(audio.getall("TALB"))
         isrc = self._id3_text(audio.getall("TSRC"))
         spotify_id = self._id3_txxx(audio, "SPOTIFYID")
-        return self._identity_keys_from_values(title, artists, album, isrc, spotify_id)
+        upc = self._id3_txxx(audio, "UPC") or self._id3_txxx(audio, "BARCODE")
+        track_number = self._parse_track_number(self._id3_text(audio.getall("TRCK")))
+        disc_number = self._parse_track_number(self._id3_text(audio.getall("TPOS")))
+        return self._identity_keys_from_values(
+            title, artists, album, isrc, spotify_id, upc, track_number, disc_number
+        )
+
+    @staticmethod
+    def _parse_track_number(value) -> Optional[int]:
+        """Parse a track number from any of the shapes tags use: 7, "7", "7/12"."""
+        if value is None:
+            return None
+        try:
+            text = str(value).strip()
+            if not text:
+                return None
+            text = text.split("/")[0].strip()
+            return int(text) or None
+        except (TypeError, ValueError):
+            return None
 
     def _extract_mp4_identity_keys(self, path: Path) -> list[str]:
         audio = MP4(path)
@@ -469,13 +549,70 @@ class LibraryOrganizer:
         album = self._first(audio.get("\xa9alb"))
         isrc = self._first_freeform(audio, "ISRC")
         spotify_id = self._first_freeform(audio, "SPOTIFYID")
-        return self._identity_keys_from_values(title, artists, album, isrc, spotify_id)
+        upc = self._first_freeform(audio, "UPC") or self._first_freeform(audio, "BARCODE")
+        track_number = None
+        try:
+            trkn = audio.get("trkn")
+            if trkn and isinstance(trkn[0], (list, tuple)) and trkn[0]:
+                track_number = int(trkn[0][0]) or None
+        except Exception:
+            track_number = None
+        disc_number = None
+        try:
+            disk = audio.get("disk")
+            if disk and isinstance(disk[0], (list, tuple)) and disk[0]:
+                disc_number = int(disk[0][0]) or None
+        except Exception:
+            disc_number = None
+        return self._identity_keys_from_values(
+            title, artists, album, isrc, spotify_id, upc, track_number, disc_number
+        )
 
     def _extract_filename_identity_keys(self, path: Path) -> list[str]:
         stem = path.stem
         stem = re.sub(r"^\d+\s*-\s*", "", stem).strip()
         title = stem or "Unknown Track"
         return self._identity_keys_from_values(title, [], None, None, None)
+
+    # UPC/barcode appears under many different tag spellings depending on which
+    # tool wrote the file (v1.1.8 FEAT-6, ported from SpotiFLAC's upc_tags.go).
+    # We already WRITE `barcode`, but only ever read our own spelling back, so a
+    # library containing files tagged by other tools lost the signal entirely.
+    _UPC_TAG_KEYS = (
+        "upc", "barcode",
+        "txxx:upc", "txxx:barcode", "txxx/upc", "txxx/barcode",
+        "wm/upc",
+        "----:com.apple.itunes:upc", "----:com.apple.itunes:barcode",
+    )
+
+    @classmethod
+    def _first_upc(cls, tags: dict) -> Optional[str]:
+        """Return the first UPC/barcode found under any known spelling.
+
+        `tags` is a case-insensitive-ish mapping of tag name -> value(s).
+        """
+        if not tags:
+            return None
+        lowered = {}
+        for k, v in tags.items():
+            try:
+                lowered[str(k).strip().lower()] = v
+            except Exception:
+                continue
+        for key in cls._UPC_TAG_KEYS:
+            val = lowered.get(key)
+            if val is None:
+                continue
+            if isinstance(val, (list, tuple)):
+                val = val[0] if val else None
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", errors="ignore")
+            val = str(val or "").strip()
+            # Keep digits only — barcodes are written with stray spaces/hyphens.
+            digits = re.sub(r"\D", "", val)
+            if digits:
+                return digits
+        return None
 
     def _identity_keys_from_values(
         self,
@@ -484,10 +621,22 @@ class LibraryOrganizer:
         album: Optional[str],
         isrc: Optional[str],
         spotify_id: Optional[str],
+        upc: Optional[str] = None,
+        track_number: Optional[int] = None,
+        disc_number: Optional[int] = None,
     ) -> list[str]:
         keys: list[str] = []
         if isrc:
             keys.append(f"isrc:{isrc.strip().lower()}")
+        # UPC alone is an ALBUM identifier, so it is only a track identity when
+        # combined with disc AND track number — otherwise every track on a
+        # release would collide with every other, and on a multi-disc release
+        # disc 2 track N collides with disc 1 track N (v1.1.8 BUG-10).
+        if upc and track_number:
+            keys.append(
+                f"upc:{re.sub(r'\D', '', str(upc))}"
+                f":{int(disc_number or 1)}:{int(track_number)}"
+            )
         if spotify_id:
             keys.append(f"spotify:{spotify_id.strip()}")
 
@@ -558,6 +707,18 @@ class LibraryOrganizer:
     def _normalize_identity_part(value: Optional[str]) -> str:
         if not value:
             return ""
+        # Unicode-normalize BEFORE stripping (v1.1.8 BUG-3). Without this the
+        # same title produces different identity keys depending on which
+        # normalization form it arrives in — and macOS is where the two forms
+        # meet, since HFS+/APFS work in NFD while tags and APIs generally carry
+        # NFC. Stripping first meant:
+        #     "Björk"  NFC (o-umlaut as one char) -> "bjrk"   (letter deleted)
+        #     "Björk"  NFD (o + combining umlaut) -> "bjork"  (mark deleted)
+        # Two keys for one track, so dedup silently failed on any accented
+        # title. Decomposing first and dropping only the combining marks folds
+        # both forms to "bjork".
+        value = unicodedata.normalize("NFKD", value)
+        value = "".join(ch for ch in value if not unicodedata.combining(ch))
         value = value.lower()
         value = re.sub(r"\s+", " ", value)
         value = re.sub(r"[^a-z0-9 ]+", "", value)

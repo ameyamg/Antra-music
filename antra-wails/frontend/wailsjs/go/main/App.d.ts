@@ -24,9 +24,11 @@ export function GetArtistDiscography(arg1:string):Promise<string>;
 
 export function GetConfig():Promise<main.Config>;
 
-export function GetDiscoveryData(arg1:string,arg2:string,arg3:string):Promise<string>;
+export function GetDeviceAccountStatus():Promise<main.DeviceAccountStatus>;
 
-export function GetDiscoveryGenres(arg1:string):Promise<string>;
+export function GetDiscoveryData(arg1:string,arg2:string,arg3:string,arg4:string):Promise<string>;
+
+export function GetDiscoveryGenres(arg1:string,arg2:string):Promise<string>;
 
 export function GetDownloadedMusicLibrary():Promise<string>;
 
@@ -56,6 +58,10 @@ export function PickAnalyzerFiles():Promise<Array<string>>;
 
 export function PickDirectory():Promise<string>;
 
+export function PollDeviceLogin(arg1:string):Promise<main.DeviceTokenResult>;
+
+export function RenewDeviceTokenIfNeeded():Promise<main.DeviceRenewResult>;
+
 export function RetryTrackDownload(arg1:string):Promise<void>;
 
 export function RunAutoSync():Promise<string>;
@@ -72,13 +78,19 @@ export function SetSpotifyCookie(arg1:string):Promise<string>;
 
 export function SetSpotifyToken(arg1:string):Promise<string>;
 
+export function SignOutDevice():Promise<string>;
+
 export function StartAmazonBrowserLogin():Promise<void>;
 
 export function StartAppleBrowserLogin():Promise<void>;
 
+export function StartDeviceLogin():Promise<main.DeviceCodeResult>;
+
 export function StartDownload(arg1:Array<string>):Promise<void>;
 
 export function StartTidalOAuthLogin():Promise<void>;
+
+export function ValidateKey(arg1:string):Promise<main.KeyInfoResult>;
 
 export function ValidateTidalAuth():Promise<string>;
 

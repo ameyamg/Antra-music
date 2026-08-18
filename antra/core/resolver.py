@@ -18,7 +18,7 @@ from typing import Optional
 
 from antra.core.models import TrackMetadata, SearchResult
 from antra.sources.base import BaseSourceAdapter, RateLimitedError
-from antra.utils.matching import duration_close
+from antra.utils.matching import duration_close, version_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,11 @@ ACCEPT_THRESHOLD = 0.70
 LOSSLESS_ACCEPT_THRESHOLD = 0.55
 LOSSY_ACCEPT_THRESHOLD = 0.65
 YOUTUBE_ACCEPT_THRESHOLD = 0.80
+# Absolute floor for the last-resort "no adapter cleared threshold" fallback.
+# Historically that fallback returned the best result with NO minimum at all,
+# which silently downloaded wrong songs whenever every adapter returned noise
+# (v1.1.8 BUG-1). A result below this floor fails the track instead.
+FALLBACK_FLOOR = 0.60
 
 
 # Patterns that identify radio edits, clean versions, or otherwise censored variants.
@@ -230,6 +235,20 @@ class SourceResolver:
             self._tier_rotation[key] = (offset + 1) % len(ordered)
         return ordered[offset:] + ordered[:offset]
 
+    def _atmos_service(self) -> Optional[str]:
+        """Return the service an Atmos request is pinned to, or None.
+
+        `atmos-<service>` is what actually reaches the resolver — the unified
+        `atmos` option is resolved to a concrete service by `service.py` from the
+        pasted URL's host before the engine is built.
+        """
+        fmt = (self.preferred_output_format or "").lower()
+        if fmt.startswith("atmos-"):
+            service = fmt.split("-", 1)[1]
+            if service in {"tidal", "apple", "amazon"}:
+                return service
+        return None
+
     def _build_resolve_order(self, excluded: set[str]) -> list[BaseSourceAdapter]:
         """Build a per-call adapter list for resolve().
 
@@ -249,6 +268,17 @@ class SourceResolver:
           adapters (JioSaavn, NetEase), then is_last_resort adapters (YouTube) at
           the very end as absolute last resort. Order: Amazon/HiFi → JioSaavn → YouTube.
         """
+        # Dolby Atmos (v1.1.8 FEAT-1): the mix exists on exactly one platform and
+        # is routed there by the pasted link, so the adapter list is restricted to
+        # that service's family. Checked BEFORE preserve_input_order so a
+        # source-preference setting cannot pull in an adapter that has no Atmos
+        # stream at all. Deliberately fails to nothing rather than silently
+        # resolving to a stereo FLAC from another service.
+        atmos_service = self._atmos_service()
+        if atmos_service:
+            names = self._service_adapter_names(atmos_service)
+            return [a for a in self.adapters if a.name in names and a.name not in excluded]
+
         if self.preserve_input_order:
             return self._rank_within_tiers(
                 [a for a in self.adapters if a.name not in excluded]
@@ -677,6 +707,47 @@ class SourceResolver:
             return True
         return False
 
+    def _passes_identity_gate(
+        self,
+        track: Optional[TrackMetadata],
+        result: SearchResult,
+    ) -> bool:
+        """Always-on identity sanity gate (v1.1.8 BUG-1) — applied to EVERY
+        acceptance path, strict mode or not. Rejects results that are provably
+        a different recording:
+
+          1. Severe duration mismatch (>20% + 20s shorter, or >30% + 45s longer)
+             between the requested track and the result's own declared duration.
+          2. Recording-class mismatch between the two titles — instrumental /
+             karaoke / live / remix / sped-slowed markers on one side only.
+
+        Note: adapters that echo the requested metadata back into the result
+        (native platform-ID paths) pass this trivially — their protection is
+        honest similarity scores plus the engine's post-download duration check.
+        """
+        if track is None:
+            return True
+        if track.duration_ms and result.duration_ms:
+            expected_s = track.duration_ms / 1000.0
+            actual_s = result.duration_ms / 1000.0
+            shorter = actual_s < expected_s * 0.8 and (expected_s - actual_s) >= 20
+            longer = actual_s > expected_s * 1.3 and (actual_s - expected_s) >= 45
+            if shorter or longer:
+                logger.info(
+                    "[Resolver] Rejected '%s' from %s — duration mismatch "
+                    "(expected %.0fs, result %.0fs)",
+                    result.title, result.source, expected_s, actual_s,
+                )
+                return False
+        if track.title and result.title and version_mismatch(track.title, result.title):
+            logger.info(
+                "[Resolver] Rejected '%s' from %s — recording-class mismatch vs '%s' "
+                "(instrumental/karaoke/live/remix marker on one side only)",
+                result.title, result.source, track.title,
+            )
+            return False
+        return True
+
     def _passes_strict_identity(
         self,
         track: Optional[TrackMetadata],
@@ -728,6 +799,8 @@ class SourceResolver:
         # Never immediately accept a confirmed clean/radio-edit result when we
         # know the target is explicit — keep searching for the explicit version.
         if track is not None and self._result_looks_clean(track, result):
+            return False
+        if not self._passes_identity_gate(track, result):
             return False
         if not self._passes_strict_identity(track, result, adapter):
             return False
@@ -972,6 +1045,7 @@ class SourceResolver:
                     if (
                         quality_ok
                         and not self._result_looks_clean(track, result)
+                        and self._passes_identity_gate(track, result)
                         and self._passes_strict_identity(track, result, adapter)
                     ):
                         lossless_candidates.append((result, adapter))
@@ -1010,7 +1084,7 @@ class SourceResolver:
 
             # ── Lossy-preferred mode (mp3/aac) ────────────────────────────────
             if self._is_lossy_preferred_mode():
-                if not result.is_lossless:
+                if not result.is_lossless and self._passes_identity_gate(track, result):
                     # Native lossy result — accept it if score is good enough, even when
                     # the adapter can also return lossless on other tracks (e.g. Amazon).
                     if result.isrc_match and self._meets_quality_aware_threshold(result, adapter):
@@ -1084,6 +1158,22 @@ class SourceResolver:
 
             # quality-aware but not lossless-only (e.g. "source" mode) — fall back to best lossy
             if best_result and best_adapter:
+                if not self._passes_identity_gate(track, best_result):
+                    logger.info(
+                        "[Resolver] Best lossy fallback for '%s' failed the identity gate — failing cleanly",
+                        track.title,
+                    )
+                    return None
+                effective_score = best_result.similarity_score + self._explicit_penalty(track, best_result)
+                if not best_result.isrc_match and effective_score < FALLBACK_FLOOR:
+                    logger.info(
+                        "[Resolver] Best lossy fallback for '%s' scored %.2f (< %.2f floor) — "
+                        "failing cleanly instead of risking a wrong song",
+                        track.title,
+                        effective_score,
+                        FALLBACK_FLOOR,
+                    )
+                    return None
                 logger.info(
                     f"[Resolver] No lossless found; using best available via "
                     f"{best_adapter.name}: '{best_result.title}' "
@@ -1100,6 +1190,7 @@ class SourceResolver:
                     (r, a) for r, a in candidates
                     if not r.is_lossless
                     and self._meets_quality_aware_threshold(r, a)
+                    and self._passes_identity_gate(track, r)
                     and self._passes_strict_identity(track, r, a)
                 ]
                 if lossy_candidates:
@@ -1117,6 +1208,7 @@ class SourceResolver:
                     (r, a) for r, a in candidates
                     if not getattr(a, "always_lossy", False)
                     and self._meets_quality_aware_threshold(r, a)
+                    and self._passes_identity_gate(track, r)
                     and self._passes_strict_identity(track, r, a)
                 ]
                 if lossless_fallback:
@@ -1134,6 +1226,7 @@ class SourceResolver:
                 (result, adapter)
                 for result, adapter in candidates
                 if self._meets_quality_aware_threshold(result, adapter)
+                and self._passes_identity_gate(track, result)
                 and self._passes_strict_identity(track, result, adapter)
             ]
             if acceptable:
@@ -1167,6 +1260,8 @@ class SourceResolver:
                 lossless_fallback = [
                     (r, a) for r, a in candidates
                     if r.is_lossless
+                    and self._passes_identity_gate(track, r)
+                    and (r.similarity_score + self._explicit_penalty(track, r)) >= FALLBACK_FLOOR
                 ]
                 if lossless_fallback:
                     best_lf, best_lf_adapter = max(
@@ -1178,6 +1273,27 @@ class SourceResolver:
                         f"using {best_lf_adapter.name} (lossless, will transcode): '{best_lf.title}'"
                     )
                     return best_lf, best_lf_adapter
+            # Last-resort floor (v1.1.8 BUG-1): this fallback used to return the
+            # best result with NO minimum score, which is how wrong songs got
+            # silently downloaded whenever every adapter returned noise. A result
+            # that failed the identity gate or scores below FALLBACK_FLOOR now
+            # fails the track — the Failed panel is the honest outcome.
+            if not self._passes_identity_gate(track, best_result):
+                logger.info(
+                    "[Resolver] Best remaining match for '%s' failed the identity gate — failing cleanly",
+                    track.title,
+                )
+                return None
+            effective_score = best_result.similarity_score + self._explicit_penalty(track, best_result)
+            if effective_score < FALLBACK_FLOOR:
+                logger.info(
+                    "[Resolver] Best remaining match for '%s' scored %.2f (< %.2f floor) — "
+                    "failing cleanly instead of risking a wrong song",
+                    track.title,
+                    effective_score,
+                    FALLBACK_FLOOR,
+                )
+                return None
             logger.info(
                 f"[Resolver] No adapter cleared threshold; using best match via "
                 f"{best_adapter.name}: '{best_result.title}' "

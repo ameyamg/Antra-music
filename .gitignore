@@ -80,10 +80,10 @@ spotiflac_repo/
 tidal-dl-ng-1-repo/
 
 # Loose root-level asset files (already in antra-wails/frontend/public/icons/)
-amazon-music.jpg
-apple_logo.png
-qobuz_icon.png
-tidal_logo_icon_147227.webp
+/amazon-music.jpg
+/apple_logo.png
+/qobuz_icon.png
+/tidal_logo_icon_147227.webp
 /deezer-logo-coeur-1920x1181.webp
 /Antra_newlogo.png
 /Antra Logo Animation.html
@@ -126,3 +126,39 @@ fix_amazon_opus.py
 
 # Source art for health-check chips (processed copies live in frontend/public/icons/)
 healthtabicons/
+
+# ── Wails packaging assets (must be committed) ───────────────────────────────
+# The generic `build/` rule above is for Python artifacts, but it also swallowed
+# antra-wails/build — which is where Wails reads the app icon and the macOS
+# Info.plist from. appicon.png and windows/icon.ico only survived because they
+# were force-added; anything new (build/darwin, build/linux) was silently never
+# committed, so CI built macOS/Linux with Wails' DEFAULT icon.
+!antra-wails/build/
+antra-wails/build/*
+!antra-wails/build/appicon.png
+!antra-wails/build/README.md
+!antra-wails/build/darwin/
+!antra-wails/build/linux/
+!antra-wails/build/windows/
+antra-wails/build/windows/*
+!antra-wails/build/windows/icon.ico
+!antra-wails/build/windows/info.json
+!antra-wails/build/windows/wails.exe.manifest
+
+# ── v1.1.8 additions ────────────────────────────────────────────────────────
+# Live proxy credentials in plaintext — must never reach a public repo.
+new_px.txt
+*_px.txt
+proxies*.json
+live_proxies*.txt
+
+# Operator-local scheduled task shortcut (*.lnk above misses the .disabled suffix)
+*.lnk.disabled
+
+# Internal ops docs — contain VPS IPs, SSH details and key labels
+HANDOFF_NEXT_SESSION.md
+MIGRATION_AX41.md
+QOBUZ_ISSUE_HANDOFF.md
+OPERATIONS.md
+CHANGELOG_v1.1.8.md
+CHANGELOG_v1.1.*.md

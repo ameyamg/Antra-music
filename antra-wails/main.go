@@ -30,10 +30,10 @@ func main() {
 		BackgroundColour: &options.RGBA{R: 13, G: 28, B: 28, A: 255},
 		// Start hidden to avoid the white/unstyled flash while the frontend loads.
 		// The window is revealed in OnDomReady once the Svelte app has mounted.
-		StartHidden:  true,
-		OnStartup:    app.startup,
-		OnDomReady:   app.domReady,
-		OnShutdown:   app.shutdown,
+		StartHidden: true,
+		OnStartup:   app.startup,
+		OnDomReady:  app.domReady,
+		OnShutdown:  app.shutdown,
 		Windows: &windows.Options{
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,
