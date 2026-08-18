@@ -16,10 +16,24 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, coll
 ROOT = Path.cwd().parent  # Antra/
 ENTRY = ROOT / "antra" / "json_cli.py"
 
+# ── CRITICAL: put ROOT on sys.path BEFORE any collect_submodules() call ──────
+# collect_submodules() genuinely IMPORTS the package to walk it, using the live
+# sys.path — `pathex` below only affects PyInstaller's own Analysis, not this.
+# PyInstaller is run from antra-wails/, so `antra` is NOT importable at spec
+# time and collect_submodules("antra") silently returned an EMPTY list. Every
+# build therefore relied entirely on static import analysis, which is
+# version-dependent: v1.1.8 built fine on PyInstaller 6.19 locally and shipped
+# a binary MISSING antra.utils.organizer from CI's 6.22.2, crashing on the first
+# download. Measured: 0 submodules before this line, 73 after.
+import sys
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 # ── Hidden imports ──────────────────────────────────────────────────────────
 # PyInstaller misses dynamically-imported modules; list them explicitly.
 hiddenimports = (
     collect_submodules("antra")
+    + collect_submodules("antra_shared")
     + collect_submodules("spotipy")
     + collect_submodules("mutagen")
     + collect_submodules("requests")
@@ -53,6 +67,23 @@ hiddenimports = (
         "antra.sources.deezer_mirror",
     ]
 )
+
+# ── Build-time guard ────────────────────────────────────────────────────────
+# v1.1.8 shipped a binary missing antra.utils.organizer because the collection
+# above silently produced nothing. Fail the BUILD instead of the user's first
+# download: these modules are on the critical path of every run.
+_required = {
+    "antra.core.service", "antra.core.engine", "antra.core.resolver",
+    "antra.utils.organizer", "antra.utils.tagger", "antra.utils.transcoder",
+    "antra_shared.filename_prefs",
+}
+_missing = sorted(_required - set(hiddenimports))
+if _missing:
+    raise SystemExit(
+        "backend_runtime.spec: refusing to build — these modules were not "
+        f"collected and the binary would crash at runtime: {_missing}"
+    )
+print(f"[spec] collected {len(hiddenimports)} hidden imports; critical modules present")
 
 # ── Data files ───────────────────────────────────────────────────────────────
 datas = []
