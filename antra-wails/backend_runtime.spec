@@ -68,23 +68,6 @@ hiddenimports = (
     ]
 )
 
-# ── Build-time guard ────────────────────────────────────────────────────────
-# v1.1.8 shipped a binary missing antra.utils.organizer because the collection
-# above silently produced nothing. Fail the BUILD instead of the user's first
-# download: these modules are on the critical path of every run.
-_required = {
-    "antra.core.service", "antra.core.engine", "antra.core.resolver",
-    "antra.utils.organizer", "antra.utils.tagger", "antra.utils.transcoder",
-    "antra_shared.filename_prefs",
-}
-_missing = sorted(_required - set(hiddenimports))
-if _missing:
-    raise SystemExit(
-        "backend_runtime.spec: refusing to build — these modules were not "
-        f"collected and the binary would crash at runtime: {_missing}"
-    )
-print(f"[spec] collected {len(hiddenimports)} hidden imports; critical modules present")
-
 # ── Data files ───────────────────────────────────────────────────────────────
 datas = []
 for package in ("imageio_ffmpeg", "certifi", "lyricsgenius", "spotipy"):
@@ -135,6 +118,47 @@ a = Analysis(
     noarchive=False,
     optimize=1,  # compile .pyc with basic optimisations (strips docstrings)
 )
+
+# ── Post-Analysis enforcement (v1.1.8 hotfix) ───────────────────────────────
+# v1.1.8 shipped twice with antra.utils.organizer missing. It WAS in
+# hiddenimports and PyInstaller emitted no warning — the module graph simply
+# dropped it, and only inspecting the built archive revealed that. So: verify
+# what Analysis actually produced, inject anything missing straight from disk,
+# and fail the build if it still is not there. Never trust the graph again.
+_CRITICAL = [
+    "antra.core.service", "antra.core.engine", "antra.core.resolver",
+    "antra.utils.organizer", "antra.utils.tagger", "antra.utils.transcoder",
+    "antra_shared.filename_prefs",
+]
+
+def _pure_names():
+    return {entry[0] for entry in a.pure}
+
+_have = _pure_names()
+for _mod in _CRITICAL:
+    if _mod in _have:
+        continue
+    _src = ROOT / (_mod.replace(".", "/") + ".py")
+    if not _src.is_file():
+        raise SystemExit(f"backend_runtime.spec: {_mod} missing from the checkout at {_src}")
+    print(f"[spec] FORCING missing module into archive: {_mod} <- {_src}")
+    a.pure.append((_mod, str(_src), "PYMODULE"))
+
+# Every antra/antra_shared module on disk should ship; inject any other strays too.
+for _pkg in ("antra", "antra_shared"):
+    for _src in sorted((ROOT / _pkg).rglob("*.py")):
+        _rel = _src.relative_to(ROOT).with_suffix("")
+        _name = ".".join(_rel.parts)
+        if _name.endswith(".__init__"):
+            _name = _name[: -len(".__init__")]
+        if _name not in _pure_names():
+            print(f"[spec] injecting {_name}")
+            a.pure.append((_name, str(_src), "PYMODULE"))
+
+_still = [m for m in _CRITICAL if m not in _pure_names()]
+if _still:
+    raise SystemExit(f"backend_runtime.spec: refusing to build, still missing: {_still}")
+print(f"[spec] archive verified: {len(_pure_names())} pure modules, all critical present")
 
 pyz = PYZ(a.pure)
 
