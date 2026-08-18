@@ -365,8 +365,14 @@ class LibraryOrganizer:
         # file that is a completely different song (v1.1.8 BUG-10).
         _upc = getattr(track, "upc", None)
         if _upc and track.track_number:
+            # NB: the re.sub is hoisted out of the f-string deliberately — a
+            # backslash inside an f-string expression is only legal from Python
+            # 3.12 (PEP 701) and is a SyntaxError on 3.11, which is what CI
+            # builds with. PyInstaller silently omits a module it cannot
+            # compile, which shipped three broken v1.1.8 releases.
+            _upc_digits = re.sub(r"\D", "", str(_upc))
             keys.append(
-                f"upc:{re.sub(r'\D', '', str(_upc))}"
+                f"upc:{_upc_digits}"
                 f":{int(track.disc_number or 1)}:{int(track.track_number)}"
             )
 
@@ -633,8 +639,12 @@ class LibraryOrganizer:
         # release would collide with every other, and on a multi-disc release
         # disc 2 track N collides with disc 1 track N (v1.1.8 BUG-10).
         if upc and track_number:
+            # Hoisted out of the f-string: see the note on the matching
+            # in-memory key above (backslash in an f-string expression is
+            # 3.12+ only and a SyntaxError on the 3.11 CI builds with).
+            _upc_digits = re.sub(r"\D", "", str(upc))
             keys.append(
-                f"upc:{re.sub(r'\D', '', str(upc))}"
+                f"upc:{_upc_digits}"
                 f":{int(disc_number or 1)}:{int(track_number)}"
             )
         if spotify_id:
