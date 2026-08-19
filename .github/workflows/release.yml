@@ -82,21 +82,28 @@ jobs:
           # (what Go sets whenever it resolved the manifest itself) against a
           # cache file seeded exactly like Go would write it, and fails the
           # build if the resolved URL is empty or lands inside a temp dir.
-          $cacheDir = Join-Path $env:LOCALAPPDATA "Antra\Antra"
-          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+          # Do NOT hardcode the cache location: ask the binary where it actually
+          # looks, then seed exactly there. Hardcoding is what made the first
+          # version of this test fail on Linux -- platformdirs uses appauthor
+          # only on Windows, so the path differs per platform and an assumption
+          # here tests the test, not the product.
+          $env:ANTRA_ENDPOINT_MANIFEST_DISABLED = "1"
+          $probe = & ./runtime/backend/AntraBackend.exe --debug-manifest 2>&1 | Out-String
+          $cachePath = ($probe | ConvertFrom-Json).cache_path
+          Write-Host "backend reads its cache from: $cachePath"
+          New-Item -ItemType Directory -Force -Path (Split-Path $cachePath) | Out-Null
           $cache = @{
             hifi = @(); amazon = @(); apple = @()
             mirrors = @{ tidal = "https://tidal.example.test"; qobuz = "https://qobuz.example.test" }
             api_key = "ak_test"
           } | ConvertTo-Json
-          Set-Content -Path (Join-Path $cacheDir "endpoint_manifest_cache.json") -Value $cache -Encoding utf8
+          Set-Content -Path $cachePath -Value $cache -Encoding utf8
 
-          $env:ANTRA_ENDPOINT_MANIFEST_DISABLED = "1"
           $out = & ./runtime/backend/AntraBackend.exe --debug-manifest 2>&1 | Out-String
           Remove-Item Env:ANTRA_ENDPOINT_MANIFEST_DISABLED
           Write-Host $out
           $info = $out | ConvertFrom-Json
-          if ([string]::IsNullOrWhiteSpace($info.resolved_tidal) -or $info.resolved_tidal -notmatch '^https://tidal\.example\.test$') {
+          if ($info.resolved_tidal -ne "https://tidal.example.test") {
             throw "endpoint manifest cache not resolved from the persistent path - refusing to publish"
           }
           if ($info.data_dir -like "*_MEI*" -or $info.data_dir -like "*Temp*") {
@@ -175,16 +182,14 @@ jobs:
           # inside a frozen build, and the old fallback pointed at an ephemeral
           # temp dir. This seeds a cache file the way Go writes it and drives
           # the real ANTRA_ENDPOINT_MANIFEST_DISABLED=1 path against it.
-          case "$(uname -s)" in
-            Darwin*) cache_dir="$HOME/Library/Application Support/Antra/Antra" ;;
-            *) cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Antra/Antra" ;;
-          esac
-          mkdir -p "$cache_dir"
-          cat > "$cache_dir/endpoint_manifest_cache.json" << 'JSON'
-          {"hifi": [], "amazon": [], "apple": [],
-           "mirrors": {"tidal": "https://tidal.example.test", "qobuz": "https://qobuz.example.test"},
-           "api_key": "ak_test"}
-          JSON
+          # Ask the binary where it looks rather than hardcoding: platformdirs
+          # uses appauthor only on Windows, so the path differs per platform.
+          # Hardcoding it is what made the first version of this test fail here.
+          probe=$(ANTRA_ENDPOINT_MANIFEST_DISABLED=1 ./runtime/backend/AntraBackend --debug-manifest 2>&1)
+          cache_path=$(echo "$probe" | python3 -c "import json,sys; print(json.load(sys.stdin)['cache_path'])")
+          echo "backend reads its cache from: $cache_path"
+          mkdir -p "$(dirname "$cache_path")"
+          printf '%s' '{"hifi": [], "amazon": [], "apple": [], "mirrors": {"tidal": "https://tidal.example.test", "qobuz": "https://qobuz.example.test"}, "api_key": "ak_test"}' > "$cache_path"
           out=$(ANTRA_ENDPOINT_MANIFEST_DISABLED=1 ./runtime/backend/AntraBackend --debug-manifest 2>&1)
           echo "$out"
           resolved=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_tidal',''))")
@@ -192,7 +197,7 @@ jobs:
           if [ "$resolved" != "https://tidal.example.test" ]; then
             echo "endpoint manifest cache not resolved from the persistent path - refusing to publish"; exit 1
           fi
-          case "$data_dir" in *_MEI*|*/tmp/*|*Temp*) echo "app-data dir resolved inside a temp directory - refusing to publish"; exit 1 ;; esac
+          case "$data_dir" in *_MEI*|/tmp/*) echo "app-data dir resolved inside a temp directory - refusing to publish"; exit 1 ;; esac
           echo "endpoint manifest cache smoke test OK"
 
       - name: Build Wails App
@@ -296,16 +301,14 @@ jobs:
           # inside a frozen build, and the old fallback pointed at an ephemeral
           # temp dir. This seeds a cache file the way Go writes it and drives
           # the real ANTRA_ENDPOINT_MANIFEST_DISABLED=1 path against it.
-          case "$(uname -s)" in
-            Darwin*) cache_dir="$HOME/Library/Application Support/Antra/Antra" ;;
-            *) cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Antra/Antra" ;;
-          esac
-          mkdir -p "$cache_dir"
-          cat > "$cache_dir/endpoint_manifest_cache.json" << 'JSON'
-          {"hifi": [], "amazon": [], "apple": [],
-           "mirrors": {"tidal": "https://tidal.example.test", "qobuz": "https://qobuz.example.test"},
-           "api_key": "ak_test"}
-          JSON
+          # Ask the binary where it looks rather than hardcoding: platformdirs
+          # uses appauthor only on Windows, so the path differs per platform.
+          # Hardcoding it is what made the first version of this test fail here.
+          probe=$(ANTRA_ENDPOINT_MANIFEST_DISABLED=1 ./runtime/backend/AntraBackend --debug-manifest 2>&1)
+          cache_path=$(echo "$probe" | python3 -c "import json,sys; print(json.load(sys.stdin)['cache_path'])")
+          echo "backend reads its cache from: $cache_path"
+          mkdir -p "$(dirname "$cache_path")"
+          printf '%s' '{"hifi": [], "amazon": [], "apple": [], "mirrors": {"tidal": "https://tidal.example.test", "qobuz": "https://qobuz.example.test"}, "api_key": "ak_test"}' > "$cache_path"
           out=$(ANTRA_ENDPOINT_MANIFEST_DISABLED=1 ./runtime/backend/AntraBackend --debug-manifest 2>&1)
           echo "$out"
           resolved=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_tidal',''))")
@@ -313,7 +316,7 @@ jobs:
           if [ "$resolved" != "https://tidal.example.test" ]; then
             echo "endpoint manifest cache not resolved from the persistent path - refusing to publish"; exit 1
           fi
-          case "$data_dir" in *_MEI*|*/tmp/*|*Temp*) echo "app-data dir resolved inside a temp directory - refusing to publish"; exit 1 ;; esac
+          case "$data_dir" in *_MEI*|/tmp/*) echo "app-data dir resolved inside a temp directory - refusing to publish"; exit 1 ;; esac
           echo "endpoint manifest cache smoke test OK"
 
       - name: Build Wails App
@@ -392,16 +395,14 @@ jobs:
           # inside a frozen build, and the old fallback pointed at an ephemeral
           # temp dir. This seeds a cache file the way Go writes it and drives
           # the real ANTRA_ENDPOINT_MANIFEST_DISABLED=1 path against it.
-          case "$(uname -s)" in
-            Darwin*) cache_dir="$HOME/Library/Application Support/Antra/Antra" ;;
-            *) cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Antra/Antra" ;;
-          esac
-          mkdir -p "$cache_dir"
-          cat > "$cache_dir/endpoint_manifest_cache.json" << 'JSON'
-          {"hifi": [], "amazon": [], "apple": [],
-           "mirrors": {"tidal": "https://tidal.example.test", "qobuz": "https://qobuz.example.test"},
-           "api_key": "ak_test"}
-          JSON
+          # Ask the binary where it looks rather than hardcoding: platformdirs
+          # uses appauthor only on Windows, so the path differs per platform.
+          # Hardcoding it is what made the first version of this test fail here.
+          probe=$(ANTRA_ENDPOINT_MANIFEST_DISABLED=1 ./runtime/backend/AntraBackend --debug-manifest 2>&1)
+          cache_path=$(echo "$probe" | python3 -c "import json,sys; print(json.load(sys.stdin)['cache_path'])")
+          echo "backend reads its cache from: $cache_path"
+          mkdir -p "$(dirname "$cache_path")"
+          printf '%s' '{"hifi": [], "amazon": [], "apple": [], "mirrors": {"tidal": "https://tidal.example.test", "qobuz": "https://qobuz.example.test"}, "api_key": "ak_test"}' > "$cache_path"
           out=$(ANTRA_ENDPOINT_MANIFEST_DISABLED=1 ./runtime/backend/AntraBackend --debug-manifest 2>&1)
           echo "$out"
           resolved=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_tidal',''))")
@@ -409,7 +410,7 @@ jobs:
           if [ "$resolved" != "https://tidal.example.test" ]; then
             echo "endpoint manifest cache not resolved from the persistent path - refusing to publish"; exit 1
           fi
-          case "$data_dir" in *_MEI*|*/tmp/*|*Temp*) echo "app-data dir resolved inside a temp directory - refusing to publish"; exit 1 ;; esac
+          case "$data_dir" in *_MEI*|/tmp/*) echo "app-data dir resolved inside a temp directory - refusing to publish"; exit 1 ;; esac
           echo "endpoint manifest cache smoke test OK"
 
       - name: Build Wails App

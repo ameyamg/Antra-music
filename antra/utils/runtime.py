@@ -194,6 +194,11 @@ def get_app_data_dir() -> Path:
     except Exception:
         pass
 
+    # These MUST match platformdirs' own per-platform convention, because the
+    # fallback and the happy path have to resolve to the SAME directory --
+    # otherwise a machine where platformdirs works and one where it does not
+    # would read different caches. platformdirs uses appauthor only on Windows;
+    # macOS and Linux ignore it, which is why only the Windows branch is nested.
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
         if base:
@@ -201,12 +206,12 @@ def get_app_data_dir() -> Path:
     elif sys.platform == "darwin":
         home = os.environ.get("HOME")
         if home:
-            return Path(home) / "Library" / "Application Support" / "Antra" / "Antra"
+            return Path(home) / "Library" / "Application Support" / "Antra"
     else:
         home = os.environ.get("HOME")
         if home:
             xdg = os.environ.get("XDG_DATA_HOME") or str(Path(home) / ".local" / "share")
-            return Path(xdg) / "Antra" / "Antra"
+            return Path(xdg) / "Antra"
 
     # Only reachable if even HOME/LOCALAPPDATA are unset, which means the OS
     # itself gave us nothing persistent to work with.
