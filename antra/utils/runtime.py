@@ -162,3 +162,52 @@ def ensure_runtime_environment() -> None:
     if ffmpeg_dir not in current_path.split(os.pathsep):
         os.environ["PATH"] = ffmpeg_dir + os.pathsep + current_path
     os.environ.setdefault("IMAGEIO_FFMPEG_EXE", exe)
+
+
+def get_app_data_dir() -> Path:
+    """Return a persistent, writable per-user data directory for Antra.
+
+    Every cache/DB module in this codebase (endpoint_manifest, config,
+    isrc_cache, provider_stats, lyrics_cache) used the same pattern: try
+    platformdirs, and on ANY exception fall back to
+    ``Path(__file__).resolve().parents[2]``. In a frozen PyInstaller build that
+    fallback resolves inside ``sys._MEIPASS`` -- a fresh temp directory that is
+    deleted the instant the process exits (the exact "ephemeral path" class of
+    bug already fixed for ffmpeg in this file). If platformdirs ever raises
+    inside the frozen exe -- our own experience this session is that
+    PyInstaller's collector can silently omit a submodule from the archive with
+    zero warning, and platformdirs lazily imports an OS-specific submodule
+    (platformdirs.windows / .macos / .unix) the first time it is CALLED, not
+    when it is imported -- every one of those five modules would silently point
+    at a directory that vanishes on every relaunch. That is indistinguishable
+    from "the cache/database is always empty", and for endpoint_manifest.py
+    specifically it means the cache Go just wrote is never seen by Python.
+
+    So the fallback here is a real, persistent, OS-appropriate directory
+    computed WITHOUT platformdirs -- mirroring exactly what the Go desktop
+    shell's own getAppDataDir() already does, so both sides converge on the
+    same path even in the worst case.
+    """
+    try:
+        from platformdirs import user_data_dir
+        return Path(user_data_dir("Antra", "Antra"))
+    except Exception:
+        pass
+
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "Antra" / "Antra"
+    elif sys.platform == "darwin":
+        home = os.environ.get("HOME")
+        if home:
+            return Path(home) / "Library" / "Application Support" / "Antra" / "Antra"
+    else:
+        home = os.environ.get("HOME")
+        if home:
+            xdg = os.environ.get("XDG_DATA_HOME") or str(Path(home) / ".local" / "share")
+            return Path(xdg) / "Antra" / "Antra"
+
+    # Only reachable if even HOME/LOCALAPPDATA are unset, which means the OS
+    # itself gave us nothing persistent to work with.
+    return Path.home() / ".antra"

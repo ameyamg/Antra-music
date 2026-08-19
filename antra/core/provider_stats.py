@@ -88,12 +88,8 @@ class ProviderStats:
 
     @staticmethod
     def default_path() -> str:
-        try:
-            from platformdirs import user_data_dir
-            base = user_data_dir("Antra", "Antra")
-        except Exception:
-            base = str(Path(__file__).resolve().parents[2])
-        return str(Path(base) / "provider_stats.db")
+        from antra.utils.runtime import get_app_data_dir
+        return str(get_app_data_dir() / "provider_stats.db")
 
     def record(self, adapter: str, success: bool) -> None:
         """Record one download outcome for an adapter. Failures are non-fatal."""

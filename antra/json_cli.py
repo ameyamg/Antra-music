@@ -2395,6 +2395,8 @@ def main():
     parser.add_argument("--config", help="Path to config.json from Go launcher")
     parser.add_argument("--get-ffmpeg-dir", action="store_true",
                         help="Print the paths to bundled ffmpeg/ffprobe (two lines) and exit")
+    parser.add_argument("--debug-manifest", action="store_true",
+                        help="Print endpoint-manifest cache resolution diagnostics and exit")
     parser.add_argument("--export-ffmpeg", metavar="DIR",
                         help="Copy the bundled ffmpeg/ffprobe into DIR and print their "
                              "persistent paths (two lines), then exit")
@@ -2629,6 +2631,33 @@ def main():
         finally:
             if _os.path.exists(tmp_path):
                 _os.unlink(tmp_path)
+        sys.exit(0)
+
+    if args.debug_manifest:
+        import sys as _sys
+        from antra.core import endpoint_manifest as _em
+        info = {
+            "frozen": bool(getattr(_sys, "frozen", False)),
+            "meipass": getattr(_sys, "_MEIPASS", None),
+            "module_file": getattr(_em, "__file__", None),
+            "data_dir": str(_em._DATA_DIR),
+            "cache_path": str(_em._CACHE_PATH),
+            "cache_exists": _em._CACHE_PATH.exists(),
+            "env_localappdata": os.environ.get("LOCALAPPDATA"),
+            "manifest_fetch_disabled": _em.manifest_fetch_disabled(),
+        }
+        try:
+            import platformdirs as _pd
+            info["platformdirs_ok"] = True
+            info["platformdirs_file"] = getattr(_pd, "__file__", None)
+            info["platformdirs_result"] = _pd.user_data_dir("Antra", "Antra")
+        except Exception as _e:
+            info["platformdirs_ok"] = False
+            info["platformdirs_error"] = repr(_e)
+        m = _em.load_endpoint_manifest()
+        info["resolved_tidal"] = m.mirror_tidal
+        info["resolved_qobuz"] = m.mirror_qobuz
+        print(json.dumps(info, indent=2))
         sys.exit(0)
 
     if args.get_ffmpeg_dir:

@@ -60,12 +60,13 @@ logger = logging.getLogger(__name__)
 # ANTRA_ENDPOINT_MANIFEST_URL or explicit mirror URL env vars.
 DEFAULT_ENDPOINT_MANIFEST_URL = "https://gist.githubusercontent.com/anandprtp/fdc2c16b7bfdc2d337fbc86161b79371/raw"
 
-try:
-    from platformdirs import user_data_dir
+from antra.utils.runtime import get_app_data_dir
 
-    _DATA_DIR = Path(user_data_dir("Antra", "Antra"))
-except Exception:
-    _DATA_DIR = Path(__file__).resolve().parents[2]
+# See get_app_data_dir()'s docstring: this is a robust, never-ephemeral
+# resolution. It replaces a bare platformdirs try/except whose fallback
+# resolved inside sys._MEIPASS in a frozen build -- a fresh temp dir wiped on
+# exit -- which made the cache Go writes invisible to Python on every launch.
+_DATA_DIR = get_app_data_dir()
 
 _CACHE_PATH = _DATA_DIR / "endpoint_manifest_cache.json"
 _REQUEST_TIMEOUT = 5

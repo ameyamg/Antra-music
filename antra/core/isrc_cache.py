@@ -86,12 +86,8 @@ class ISRCCache:
 
     @staticmethod
     def default_path() -> str:
-        try:
-            from platformdirs import user_data_dir
-            base = user_data_dir("Antra", "Antra")
-        except Exception:
-            base = str(Path(__file__).resolve().parents[2])
-        return str(Path(base) / "isrc_cache.db")
+        from antra.utils.runtime import get_app_data_dir
+        return str(get_app_data_dir() / "isrc_cache.db")
 
     # ── reads ──────────────────────────────────────────────────────────────
     def get(self, track_id: str) -> Optional[str]:

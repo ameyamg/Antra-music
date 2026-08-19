@@ -66,6 +66,44 @@ jobs:
           }
           Write-Host "backend smoke test OK"
 
+      - name: Smoke test endpoint manifest cache resolution
+        working-directory: antra-wails
+        shell: pwsh
+        run: |
+          # A second broken release, distinct from the first: platformdirs'
+          # user_data_dir() can raise inside a frozen build (it lazily imports
+          # an OS-specific submodule the first time it is CALLED, and that
+          # submodule can be silently dropped by PyInstaller the same way
+          # antra.utils.organizer was). The old fallback then resolved inside
+          # _MEIPASS, an ephemeral temp dir wiped on exit, so the endpoint-
+          # manifest cache Go writes was never visible to Python -- "No Tidal
+          # mirror URL available" on every download, on every machine, always.
+          # This drives the real ANTRA_ENDPOINT_MANIFEST_DISABLED=1 code path
+          # (what Go sets whenever it resolved the manifest itself) against a
+          # cache file seeded exactly like Go would write it, and fails the
+          # build if the resolved URL is empty or lands inside a temp dir.
+          $cacheDir = Join-Path $env:LOCALAPPDATA "Antra\Antra"
+          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+          $cache = @{
+            hifi = @(); amazon = @(); apple = @()
+            mirrors = @{ tidal = "https://tidal.example.test"; qobuz = "https://qobuz.example.test" }
+            api_key = "ak_test"
+          } | ConvertTo-Json
+          Set-Content -Path (Join-Path $cacheDir "endpoint_manifest_cache.json") -Value $cache -Encoding utf8
+
+          $env:ANTRA_ENDPOINT_MANIFEST_DISABLED = "1"
+          $out = & ./runtime/backend/AntraBackend.exe --debug-manifest 2>&1 | Out-String
+          Remove-Item Env:ANTRA_ENDPOINT_MANIFEST_DISABLED
+          Write-Host $out
+          $info = $out | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace($info.resolved_tidal) -or $info.resolved_tidal -notmatch '^https://tidal\.example\.test$') {
+            throw "endpoint manifest cache not resolved from the persistent path - refusing to publish"
+          }
+          if ($info.data_dir -like "*_MEI*" -or $info.data_dir -like "*Temp*") {
+            throw "app-data dir resolved inside a temp directory - refusing to publish"
+          }
+          Write-Host "endpoint manifest cache smoke test OK"
+
       - name: Build Wails App
         working-directory: antra-wails
         run: wails build -clean
@@ -129,6 +167,33 @@ jobs:
             echo "$out"; echo "Backend is missing modules - refusing to publish"; exit 1
           fi
           echo "backend smoke test OK"
+
+      - name: Smoke test endpoint manifest cache resolution
+        working-directory: antra-wails
+        run: |
+          # See the Windows job for the full explanation: platformdirs can raise
+          # inside a frozen build, and the old fallback pointed at an ephemeral
+          # temp dir. This seeds a cache file the way Go writes it and drives
+          # the real ANTRA_ENDPOINT_MANIFEST_DISABLED=1 path against it.
+          case "$(uname -s)" in
+            Darwin*) cache_dir="$HOME/Library/Application Support/Antra/Antra" ;;
+            *) cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Antra/Antra" ;;
+          esac
+          mkdir -p "$cache_dir"
+          cat > "$cache_dir/endpoint_manifest_cache.json" << 'JSON'
+          {"hifi": [], "amazon": [], "apple": [],
+           "mirrors": {"tidal": "https://tidal.example.test", "qobuz": "https://qobuz.example.test"},
+           "api_key": "ak_test"}
+          JSON
+          out=$(ANTRA_ENDPOINT_MANIFEST_DISABLED=1 ./runtime/backend/AntraBackend --debug-manifest 2>&1)
+          echo "$out"
+          resolved=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_tidal',''))")
+          data_dir=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin).get('data_dir',''))")
+          if [ "$resolved" != "https://tidal.example.test" ]; then
+            echo "endpoint manifest cache not resolved from the persistent path - refusing to publish"; exit 1
+          fi
+          case "$data_dir" in *_MEI*|*/tmp/*|*Temp*) echo "app-data dir resolved inside a temp directory - refusing to publish"; exit 1 ;; esac
+          echo "endpoint manifest cache smoke test OK"
 
       - name: Build Wails App
         working-directory: antra-wails
@@ -224,6 +289,33 @@ jobs:
           fi
           echo "backend smoke test OK"
 
+      - name: Smoke test endpoint manifest cache resolution
+        working-directory: antra-wails
+        run: |
+          # See the Windows job for the full explanation: platformdirs can raise
+          # inside a frozen build, and the old fallback pointed at an ephemeral
+          # temp dir. This seeds a cache file the way Go writes it and drives
+          # the real ANTRA_ENDPOINT_MANIFEST_DISABLED=1 path against it.
+          case "$(uname -s)" in
+            Darwin*) cache_dir="$HOME/Library/Application Support/Antra/Antra" ;;
+            *) cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Antra/Antra" ;;
+          esac
+          mkdir -p "$cache_dir"
+          cat > "$cache_dir/endpoint_manifest_cache.json" << 'JSON'
+          {"hifi": [], "amazon": [], "apple": [],
+           "mirrors": {"tidal": "https://tidal.example.test", "qobuz": "https://qobuz.example.test"},
+           "api_key": "ak_test"}
+          JSON
+          out=$(ANTRA_ENDPOINT_MANIFEST_DISABLED=1 ./runtime/backend/AntraBackend --debug-manifest 2>&1)
+          echo "$out"
+          resolved=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_tidal',''))")
+          data_dir=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin).get('data_dir',''))")
+          if [ "$resolved" != "https://tidal.example.test" ]; then
+            echo "endpoint manifest cache not resolved from the persistent path - refusing to publish"; exit 1
+          fi
+          case "$data_dir" in *_MEI*|*/tmp/*|*Temp*) echo "app-data dir resolved inside a temp directory - refusing to publish"; exit 1 ;; esac
+          echo "endpoint manifest cache smoke test OK"
+
       - name: Build Wails App
         working-directory: antra-wails
         run: wails build -clean
@@ -292,6 +384,33 @@ jobs:
             echo "$out"; echo "Backend is missing modules - refusing to publish"; exit 1
           fi
           echo "backend smoke test OK"
+
+      - name: Smoke test endpoint manifest cache resolution
+        working-directory: antra-wails
+        run: |
+          # See the Windows job for the full explanation: platformdirs can raise
+          # inside a frozen build, and the old fallback pointed at an ephemeral
+          # temp dir. This seeds a cache file the way Go writes it and drives
+          # the real ANTRA_ENDPOINT_MANIFEST_DISABLED=1 path against it.
+          case "$(uname -s)" in
+            Darwin*) cache_dir="$HOME/Library/Application Support/Antra/Antra" ;;
+            *) cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Antra/Antra" ;;
+          esac
+          mkdir -p "$cache_dir"
+          cat > "$cache_dir/endpoint_manifest_cache.json" << 'JSON'
+          {"hifi": [], "amazon": [], "apple": [],
+           "mirrors": {"tidal": "https://tidal.example.test", "qobuz": "https://qobuz.example.test"},
+           "api_key": "ak_test"}
+          JSON
+          out=$(ANTRA_ENDPOINT_MANIFEST_DISABLED=1 ./runtime/backend/AntraBackend --debug-manifest 2>&1)
+          echo "$out"
+          resolved=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_tidal',''))")
+          data_dir=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin).get('data_dir',''))")
+          if [ "$resolved" != "https://tidal.example.test" ]; then
+            echo "endpoint manifest cache not resolved from the persistent path - refusing to publish"; exit 1
+          fi
+          case "$data_dir" in *_MEI*|*/tmp/*|*Temp*) echo "app-data dir resolved inside a temp directory - refusing to publish"; exit 1 ;; esac
+          echo "endpoint manifest cache smoke test OK"
 
       - name: Build Wails App
         working-directory: antra-wails

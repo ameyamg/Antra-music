@@ -19,11 +19,10 @@ except ImportError:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SPOTIFY_AUTH_PATH = str(REPO_ROOT / ".antra_auth.json")
 
-try:
-    from platformdirs import user_data_dir
-    _data_dir = user_data_dir("Antra", "Antra")
-except Exception:
-    _data_dir = str(REPO_ROOT)
+from antra.utils.runtime import get_app_data_dir
+# Never falls back to an ephemeral _MEIPASS path in a frozen build -- see
+# get_app_data_dir()'s docstring.
+_data_dir = str(get_app_data_dir())
 DEFAULT_SPOTIFY_CACHE_PATH = str(Path(_data_dir) / ".spotify_cache")
 
 # Hardcoded Antra Spotify App client ID (PKCE flow — no secret needed)
