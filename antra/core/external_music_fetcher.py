@@ -16,6 +16,47 @@ import requests
 from antra.core.config import Config
 from antra.core.models import TrackMetadata
 
+
+def _mirror_key(cfg) -> str:
+    """Key used to authenticate metadata calls against the VPS mirrors.
+
+    Deliberately the SAME resolver the download path uses
+    (`service._resolve_mirror_api_key`): validated-supporter key -> manifest key
+    -> the user's personal key.
+
+    These two fetchers used to hand-roll their own two-source chain, in opposite
+    orders to each other, and neither consulted ANTRA_MIRROR_API_KEY. When the Go
+    layer supplies the endpoints it also sets ANTRA_ENDPOINT_MANIFEST_DISABLED=1,
+    so the manifest is read from cache only -- and on any machine where that
+    cache was unreadable BOTH sources came back empty, the X-API-Key header was
+    omitted entirely, and the mirror answered `401 API key required`. That is a
+    MISSING credential, not a rejected one (a bad key answers 403), which is why
+    it read like a server outage.
+
+    Imported lazily: antra.core.service imports THIS module, so a module-level
+    import would be circular.
+    """
+    try:
+        from antra.core.service import _resolve_mirror_api_key
+        key = (_resolve_mirror_api_key(cfg) or "").strip()
+        if key:
+            return key
+    except Exception:  # pragma: no cover - never fail a fetch over key lookup
+        pass
+    # Same priority without the import, so a refactor upstream cannot strand us.
+    import os as _os
+    key = (_os.environ.get("ANTRA_MIRROR_API_KEY") or "").strip()
+    if not key:
+        try:
+            from antra.core.endpoint_manifest import load_endpoint_manifest
+            key = (getattr(load_endpoint_manifest(), "api_key", "") or "").strip()
+        except Exception:
+            key = ""
+    if not key:
+        key = (getattr(cfg, "antra_api_key", "") or "").strip()
+    return key
+
+
 logger = logging.getLogger(__name__)
 
 _DEEZER_API = "https://api.deezer.com"
@@ -307,10 +348,13 @@ class ExternalMusicFetcher:
         from antra.core.endpoint_manifest import load_endpoint_manifest
 
         manifest = load_endpoint_manifest()
-        mirror_url = (getattr(manifest, "mirror_qobuz", "") or "").rstrip("/")
-        api_key = (getattr(manifest, "api_key", "") or "").strip()
-        if not api_key:
-            api_key = (getattr(self.cfg, "antra_api_key", "") or "").strip()
+        # cfg first: QOBUZ_MIRROR_URL is exported by the Go layer alongside
+        # ANTRA_ENDPOINT_MANIFEST_DISABLED. Reading only the manifest meant that on
+        # a machine with no cache the URL came back empty and this raised "No Qobuz
+        # mirror URL available" even though Go had just supplied it.
+        mirror_url = ((getattr(self.cfg, "qobuz_mirror_url", "") or "").strip()
+                      or (getattr(manifest, "mirror_qobuz", "") or "")).rstrip("/")
+        api_key = _mirror_key(self.cfg)
 
         if not mirror_url:
             raise RuntimeError(
@@ -566,12 +610,11 @@ class ExternalMusicFetcher:
         from antra.core.endpoint_manifest import load_endpoint_manifest
 
         manifest = load_endpoint_manifest()
-        mirror_url = (getattr(manifest, "mirror_tidal", "") or "").rstrip("/")
-        # User's personal key takes priority (consistent with download path in service.py).
-        # Fall back to the manifest's shared key if the user hasn't set one.
-        api_key = (getattr(self.cfg, "antra_api_key", "") or "").strip()
-        if not api_key:
-            api_key = (getattr(manifest, "api_key", "") or "").strip()
+        # cfg first — see the note in _fetch_qobuz_via_mirror: TIDAL_MIRROR_URL is
+        # exported by the Go layer and was being ignored here.
+        mirror_url = ((getattr(self.cfg, "tidal_mirror_url", "") or "").strip()
+                      or (getattr(manifest, "mirror_tidal", "") or "")).rstrip("/")
+        api_key = _mirror_key(self.cfg)
 
         if not mirror_url:
             raise RuntimeError(

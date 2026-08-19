@@ -116,10 +116,20 @@ def load_endpoint_manifest(manifest_url: str | None = None) -> EndpointManifest:
     if manifest_fetch_disabled():
         # The endpoints are already in the environment; the cache (written by the
         # Go layer) fills in anything the env vars do not cover.
+        env_key = (os.getenv("ANTRA_MANIFEST_API_KEY", "") or "").strip()
         cached = _read_cache()
         if cached is not None:
+            # The env key wins over a stale cached one, and rescues the case where
+            # the cache exists but predates the key being published.
+            if env_key:
+                cached.api_key = env_key
             return cached
-        return EndpointManifest(hifi=[], amazon=[], apple=[])
+        # No cache. Before this, that returned a manifest with NO api_key, the
+        # X-API-Key header was dropped, and every Tidal/Qobuz metadata call got
+        # `401 API key required` -- a missing credential, not a rejected one.
+        # The Go layer now exports the key with the URLs, so an unreadable or
+        # absent cache is no longer fatal.
+        return EndpointManifest(hifi=[], amazon=[], apple=[], api_key=env_key)
 
     manifest_url = (manifest_url or os.getenv("ANTRA_ENDPOINT_MANIFEST_URL") or DEFAULT_ENDPOINT_MANIFEST_URL).strip()
 

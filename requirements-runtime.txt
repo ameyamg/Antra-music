@@ -8,6 +8,15 @@ pycryptodomex>=3.23.0
 Pillow>=10.0.0
 imageio-ffmpeg>=0.6.0
 
+# -- Per-platform app-data directory -----------------------------------------
+# antra/utils/runtime.get_app_data_dir() resolves the config/cache directory
+# with this, and the endpoint-manifest cache lives there. It was never declared,
+# so CI never installed it: collect_submodules("platformdirs") in
+# backend_runtime.spec then returned [] SILENTLY and the shipped backend raised
+# ModuleNotFoundError for it (local builds worked only because it happened to be
+# installed transitively). Same silent-collector trap as BUG-12.
+platformdirs>=4.0.0
+
 # ── Soulseek / slskd integration ────────────────────────────────────────────
 slskd-api>=0.1.5
 

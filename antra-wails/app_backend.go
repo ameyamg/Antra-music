@@ -1490,8 +1490,27 @@ func endpointEnvFrom(m endpointManifest) []string {
 	add("APPLE_MIRRORS", m.Mirrors.Apple)
 	add("AMAZON_MIRRORS", m.Mirrors.Amazon)
 	// Only claim the backend needs no manifest when we actually gave it the
-	// endpoints; otherwise let it resolve them the old way.
-	if len(env) > 0 {
+	// endpoints; otherwise let it resolve them the old way. Counted BEFORE the
+	// key is appended, so a manifest carrying a key but no URLs cannot make the
+	// backend believe it was handed endpoints it never received.
+	gaveEndpoints := len(env) > 0
+	// Hand over the manifest's key alongside its URLs.
+	//
+	// Setting ANTRA_ENDPOINT_MANIFEST_DISABLED stops Python fetching the gist,
+	// after which its ONLY remaining source for the shared key is the on-disk
+	// cache. On any machine where that cache is missing or unreadable both the
+	// manifest key and the personal key came back empty, the X-API-Key header
+	// was omitted, and every Tidal/Qobuz metadata call got
+	// `401 API key required`. Exporting the key with the URLs it belongs to
+	// removes that dependency entirely.
+	//
+	// Kept separate from ANTRA_MIRROR_API_KEY on purpose: that one means "a key
+	// the server confirmed is a SUPPORTER key" and it outranks this for FEAT-7's
+	// pacing discount. Overloading it would price every free user as a supporter.
+	if k := strings.TrimSpace(m.ApiKey); k != "" {
+		env = append(env, "ANTRA_MANIFEST_API_KEY="+k)
+	}
+	if gaveEndpoints {
 		env = append(env, "ANTRA_ENDPOINT_MANIFEST_DISABLED=1")
 	}
 	return env

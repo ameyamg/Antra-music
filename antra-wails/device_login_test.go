@@ -191,12 +191,35 @@ func TestEndpointEnvFrom(t *testing.T) {
 	if got["ANTRA_ENDPOINT_MANIFEST_DISABLED"] != "1" {
 		t.Error("manifest fetch was not disabled for the backend")
 	}
-	// A credential must never travel this way; the device token goes as
-	// ANTRA_MIRROR_API_KEY and nowhere else.
+	// The per-user DEVICE TOKEN must never travel this way -- it goes as
+	// ANTRA_MIRROR_API_KEY and nowhere else. The shared MANIFEST key is the
+	// deliberate exception: with ANTRA_ENDPOINT_MANIFEST_DISABLED set, Python's
+	// only other source for it is the on-disk cache, and when that was
+	// unreadable it sent no X-API-Key at all and every Tidal/Qobuz metadata call
+	// returned `401 API key required`.
 	for k, v := range got {
+		if k == "ANTRA_MANIFEST_API_KEY" {
+			continue
+		}
 		if strings.HasPrefix(v, "ak_") || strings.HasPrefix(v, "at_") || strings.HasPrefix(v, "pk_") {
 			t.Errorf("%s leaked a credential", k)
 		}
+	}
+
+	// The manifest key must actually be handed over when there is one.
+	withKey := endpointEnvFrom(endpointManifest{
+		Mirrors: endpointManifestMirrors{Tidal: "https://t.example"},
+		ApiKey:  "ak_shared_example",
+	})
+	if !contains(withKey, "ANTRA_MANIFEST_API_KEY=ak_shared_example") {
+		t.Errorf("manifest key was not exported: %v", withKey)
+	}
+
+	// ...and a key WITHOUT any URL must not make the backend believe it was
+	// handed endpoints, or it would skip the manifest having resolved nothing.
+	keyOnly := endpointEnvFrom(endpointManifest{ApiKey: "ak_shared_example"})
+	if contains(keyOnly, "ANTRA_ENDPOINT_MANIFEST_DISABLED=1") {
+		t.Errorf("disabled the manifest on a key-only payload: %v", keyOnly)
 	}
 
 	// Partial manifest: absent entries are omitted, not exported blank — a blank
@@ -218,4 +241,14 @@ func TestEndpointEnvFrom(t *testing.T) {
 	if env := endpointEnvFrom(endpointManifest{}); len(env) != 0 {
 		t.Errorf("empty manifest exported %v", env)
 	}
+}
+
+
+func contains(env []string, want string) bool {
+	for _, kv := range env {
+		if kv == want {
+			return true
+		}
+	}
+	return false
 }
