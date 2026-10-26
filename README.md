@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/antra-header.svg" width="100%" alt="Antra"/>
+  <img src="assets/antra-header.svg" width="100%" alt="Antra: get the master, not the stream."/>
 </p>
 
 <p align="center">
@@ -30,10 +30,11 @@
 <br/>
 
 <p align="center">
-  <img src="assets/screenshots/ss_1_v117.png" width="780"/>
+  <img src="assets/antra-flow.svg" width="100%" alt="Paste a link, Antra resolves it across six sources, you get a tagged lossless file."/>
 </p>
+
 <p align="center">
-  <img src="assets/screenshots/ss_2_v117.png" width="780"/>
+  <img src="assets/antra-showcase.svg" width="100%" alt="The Antra desktop app previewing a playlist, and the Antra website showing a live download."/>
 </p>
 
 ---
@@ -132,5 +133,5 @@ Huge thanks to these folks for bringing new ideas, feedback, and testing the bet
 ---
 
 <p align="center">
-  <sub>Built with ❤️ by <a href="https://github.com/anandprtp">Hoshiyaar Singh</a> · <a href="https://github.com/anandprtp/Antra/issues">Report an Issue</a> · <a href="https://t.me/antraaverse">Telegram</a> · <a href="https://discord.com/invite/UcY5cqMuE">Discord</a></sub>
+  <sub>Built with ❤️ by <a href="https://github.com/anandprtp">Hoshiyaar Singh</a> · <a href="https://github.com/anandprtp/Antra/issues">Report an Issue</a> · <a href="https://t.me/antraaverse">Telegram</a> · <a href="https://discord.gg/gAJ3QymUta">Discord</a></sub>
 </p>
