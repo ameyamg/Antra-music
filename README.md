@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/antra-header.svg" width="100%" alt="Antra: get the master, not the stream."/>
+  <img src="assets/antra-flow.svg" width="100%" alt="Paste a link, Antra resolves it across six sources, you get a tagged lossless file."/>
+</p>
+
+<p align="center">
+  <img src="assets/antra-showcase.svg" width="100%" alt="The Antra desktop app previewing a playlist, and the Antra website showing a live download."/>
 </p>
 
 <p align="center">
@@ -25,16 +29,6 @@
   <a href="FEATURES.md">
     <img src="https://img.shields.io/badge/✦_Feature_Guide-7DD3FC?style=for-the-badge&labelColor=0d1117"/>
   </a>
-</p>
-
-<br/>
-
-<p align="center">
-  <img src="assets/antra-flow.svg" width="100%" alt="Paste a link, Antra resolves it across six sources, you get a tagged lossless file."/>
-</p>
-
-<p align="center">
-  <img src="assets/antra-showcase.svg" width="100%" alt="The Antra desktop app previewing a playlist, and the Antra website showing a live download."/>
 </p>
 
 ---
